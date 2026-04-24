@@ -44,6 +44,11 @@ pub fn render(f: &mut Frame, app: &App) {
     render_body(f, app, outer[1]);
     render_statusbar(f, app, outer[2]);
 
+    // Modal popups (di atas semua layer)
+    if app.ui_mode == UiMode::Help {
+        render_help_popup(f, app, full);
+    }
+    
     match app.vpn_state {
         VpnState::WaitingToken => {
             render_token_popup(f, app, full);
@@ -78,6 +83,7 @@ fn render_title(f: &mut Frame, app: &App, area: Rect) {
         UiMode::NewProfile => "✨ NEW PROFILE",
         UiMode::EditProfile => "✏️ EDIT PROFILE",
         UiMode::Connect => "🔌 CONNECT",
+        UiMode::Help => "🛈 HELP",
     };
 
     let title_line = Line::from(vec![
@@ -99,11 +105,7 @@ fn render_title(f: &mut Frame, app: &App, area: Rect) {
         .border_style(Style::default().fg(C_BORDER))
         .style(Style::default().bg(C_SURFACE));
 
-    let paragraph = Paragraph::new(title_line)
-        .block(block)
-        .alignment(Alignment::Left);
-
-    f.render_widget(paragraph, area);
+    f.render_widget(Paragraph::new(title_line).block(block), area);
 }
 
 // ─── Main Body ───────────────────────────────────────────────────────────────
@@ -134,7 +136,181 @@ fn render_body(f: &mut Frame, app: &App, area: Rect) {
             render_controls(f, app, panels[0]);
             render_logs(f, app, panels[1]);
         }
+        UiMode::Help => {
+            // Konten tetap dirender sesuai mode sebelumnya
+            if let Some(ref mode) = app.previous_ui_mode {
+                match mode {
+                    UiMode::ProfileList => {
+                        let panels = Layout::default()
+                            .direction(Direction::Horizontal)
+                            .constraints([
+                                Constraint::Percentage(40),
+                                Constraint::Percentage(60),
+                            ])
+                            .split(area);
+                        render_profile_list(f, app, panels[0]);
+                        render_profile_details(f, app, panels[1]);
+                    }
+                    UiMode::Connect => {
+                        let panels = Layout::default()
+                            .direction(Direction::Horizontal)
+                            .constraints([
+                                Constraint::Length(42),
+                                Constraint::Min(10),
+                            ])
+                            .split(area);
+                        render_controls(f, app, panels[0]);
+                        render_logs(f, app, panels[1]);
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
+}
+
+// ─── Help Popup ──────────────────────────────────────────────────────────────
+fn render_help_popup(f: &mut Frame, _app: &App, area: Rect) {
+    let popup_w = 72u16;
+    let popup_h = 28u16;
+    let popup_x = area.x + (area.width.saturating_sub(popup_w)) / 2;
+    let popup_y = area.y + (area.height.saturating_sub(popup_h)) / 2;
+    let popup_area = Rect { x: popup_x, y: popup_y, width: popup_w, height: popup_h };
+    
+    f.render_widget(Clear, popup_area);
+    
+    let block = Block::default()
+        .title(Span::styled(
+            " 🛈  HELP - Keyboard Shortcuts  🛈 ",
+            Style::default().fg(C_CYAN).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
+        .border_style(Style::default().fg(C_CYAN))
+        .style(Style::default().bg(Color::Rgb(20, 20, 30)));
+    
+    f.render_widget(block, popup_area);
+    
+    let inner = Rect {
+        x: popup_area.x + 2,
+        y: popup_area.y + 1,
+        width: popup_area.width.saturating_sub(4),
+        height: popup_area.height.saturating_sub(2),
+    };
+    
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(7),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(6),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(7),
+            Constraint::Length(1),
+            Constraint::Length(2),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+    
+    let title_style = Style::default().fg(C_YELLOW).add_modifier(Modifier::BOLD);
+    let key_style = Style::default().fg(C_CYAN).add_modifier(Modifier::BOLD);
+    let desc_style = Style::default().fg(C_TEXT);
+    
+    // Global Shortcuts
+    f.render_widget(
+        Paragraph::new(Span::styled("═══════════════════════ GLOBAL SHORTCUTS ═══════════════════════", title_style)),
+        rows[1],
+    );
+    
+    let global_shortcuts = vec![
+        ("F1", "Buka help ini"),
+        ("ESC / Ctrl+B", "Kembali ke daftar profile / Tutup help"),
+        ("Ctrl+Q / Ctrl+C", "Keluar aplikasi"),
+    ];
+    
+    let global_text: Vec<Line> = global_shortcuts.iter()
+        .map(|(key, desc)| {
+            Line::from(vec![
+                Span::styled(format!("  {:<14}", key), key_style),
+                Span::styled(format!("  {}", desc), desc_style),
+            ])
+        })
+        .collect();
+    
+    f.render_widget(Paragraph::new(global_text), rows[2]);
+    
+    // Profile List Shortcuts
+    f.render_widget(
+        Paragraph::new(Span::styled("═══════════════════════ PROFILE LIST MODE ═══════════════════════", title_style)),
+        rows[4],
+    );
+    
+    let profile_shortcuts = vec![
+        ("↑ / ↓", "Pilih profile"),
+        ("Enter / F5", "Connect ke profile terpilih"),
+        ("F2 / N", "Buat profile baru"),
+        ("F3 / E", "Edit profile terpilih"),
+        ("F4 / D", "Hapus profile terpilih (konfirmasi dua kali)"),
+    ];
+    
+    let profile_text: Vec<Line> = profile_shortcuts.iter()
+        .map(|(key, desc)| {
+            Line::from(vec![
+                Span::styled(format!("  {:<14}", key), key_style),
+                Span::styled(format!("  {}", desc), desc_style),
+            ])
+        })
+        .collect();
+    
+    f.render_widget(Paragraph::new(profile_text), rows[5]);
+    
+    // Connect Mode Shortcuts
+    f.render_widget(
+        Paragraph::new(Span::styled("═══════════════════════ CONNECT MODE ═══════════════════════", title_style)),
+        rows[7],
+    );
+    
+    let connect_shortcuts = vec![
+        ("Tab", "Pindah fokus ke field berikutnya"),
+        ("Shift+Tab", "Pindah fokus ke field sebelumnya"),
+        ("Enter", "Connect / Disconnect"),
+        ("Ctrl+P", "Tampilkan/sembunyikan password"),
+        ("Ctrl+S", "Simpan konfigurasi ke profile"),
+        ("↑ / ↓ / PgUp / PgDn", "Scroll log"),
+        ("F5", "Scroll ke bottom log"),
+    ];
+    
+    let connect_text: Vec<Line> = connect_shortcuts.iter()
+        .map(|(key, desc)| {
+            Line::from(vec![
+                Span::styled(format!("  {:<14}", key), key_style),
+                Span::styled(format!("  {}", desc), desc_style),
+            ])
+        })
+        .collect();
+    
+    f.render_widget(Paragraph::new(connect_text), rows[8]);
+    
+    // Hint
+    let hint_style = Style::default().fg(C_DIM);
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                "  Debug log: jalankan `openfortivpn-tui -d` untuk simpan log ke /tmp/openfortivpn-tui.log",
+                hint_style,
+            )),
+            Line::from(Span::styled(
+                "  Tekan ESC atau F1 untuk menutup help ini",
+                hint_style,
+            )),
+        ])
+            .alignment(Alignment::Center),
+        rows[10],
+    );
 }
 
 // ─── Profile List ────────────────────────────────────────────────────────────
@@ -148,11 +324,11 @@ fn render_profile_list(f: &mut Frame, app: &App, area: Rect) {
         .style(Style::default().bg(C_SURFACE));
     
     let inner = block.inner(area);
-    f.render_widget(&block, area);
+    f.render_widget(block, area);
     
     if app.profiles.is_empty() {
         let empty_msg = Paragraph::new(Span::styled(
-            "Belum ada koneksi.\n\nTekan [N] untuk membuat baru",
+            "Belum ada koneksi.\n\nTekan [F2] atau [N] untuk membuat baru",
             Style::default().fg(C_DIM),
         ))
         .alignment(Alignment::Center);
@@ -208,6 +384,7 @@ fn render_profile_details(f: &mut Frame, app: &App, area: Rect) {
         
         let inner = block.inner(area);
         f.render_widget(block, area);
+        
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .margin(1)
@@ -278,7 +455,6 @@ fn render_profile_details(f: &mut Frame, app: &App, area: Rect) {
             rows[5],
         );
         
-        // Action buttons
         let btn_area = rows[6];
         let btn_rows = Layout::default()
             .direction(Direction::Horizontal)
@@ -323,6 +499,7 @@ fn render_profile_form(f: &mut Frame, app: &App, area: Rect) {
     
     let inner = block.inner(area);
     f.render_widget(block, area);
+    
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
@@ -443,12 +620,17 @@ fn render_controls(f: &mut Frame, app: &App, area: Rect) {
         (true, false) => Style::default().fg(C_GREEN).add_modifier(Modifier::BOLD),
         _ => Style::default().fg(C_DIM),
     };
+    
+    let connect_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(if conn_focused { BorderType::Thick } else { BorderType::Rounded })
+        .border_style(Style::default().fg(if conn_focused { C_GREEN } else { C_BORDER }));
+    
     f.render_widget(
         Paragraph::new(if conn_focused { " ▶  CONNECT  [Enter]  " } else { " ▶  CONNECT  " })
-            .block(Block::default().borders(Borders::ALL)
-                .border_type(if conn_focused { BorderType::Thick } else { BorderType::Rounded })
-                .border_style(Style::default().fg(if conn_focused { C_GREEN } else { C_BORDER })))
-            .style(conn_style).alignment(Alignment::Center),
+            .block(connect_block)
+            .style(conn_style)
+            .alignment(Alignment::Center),
         rows[5],
     );
 
@@ -460,12 +642,17 @@ fn render_controls(f: &mut Frame, app: &App, area: Rect) {
         (true, false) => Style::default().fg(C_RED).add_modifier(Modifier::BOLD),
         _ => Style::default().fg(C_DIM),
     };
+    
+    let disconnect_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(if disc_focused { BorderType::Thick } else { BorderType::Rounded })
+        .border_style(Style::default().fg(if disc_focused { C_RED } else { C_BORDER }));
+    
     f.render_widget(
         Paragraph::new(if disc_focused { " ■  DISCONNECT  [Enter]  " } else { " ■  DISCONNECT  " })
-            .block(Block::default().borders(Borders::ALL)
-                .border_type(if disc_focused { BorderType::Thick } else { BorderType::Rounded })
-                .border_style(Style::default().fg(if disc_focused { C_RED } else { C_BORDER })))
-            .style(disc_style).alignment(Alignment::Center),
+            .block(disconnect_block)
+            .style(disc_style)
+            .alignment(Alignment::Center),
         rows[6],
     );
 }
@@ -534,10 +721,7 @@ fn render_input(
         Line::from(display)
     };
 
-    f.render_widget(
-        Paragraph::new(content).block(block),
-        area,
-    );
+    f.render_widget(Paragraph::new(content).block(block), area);
 }
 
 // ─── Log Panel ───────────────────────────────────────────────────────────────
@@ -627,28 +811,65 @@ fn render_logs(f: &mut Frame, app: &App, area: Rect) {
 
 // ─── Status / Hint Bar ───────────────────────────────────────────────────────
 fn render_statusbar(f: &mut Frame, app: &App, area: Rect) {
+    if app.ui_mode == UiMode::Help {
+        let hints = vec![
+            ("ESC / F1", "Tutup Help"),
+        ];
+        
+        let mut spans = vec![Span::styled("  ", Style::default())];
+        for (i, (key, desc)) in hints.iter().enumerate() {
+            spans.push(Span::styled(
+                format!("[{}]", key),
+                Style::default().fg(C_CYAN).add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(
+                format!(" {} ", desc),
+                Style::default().fg(C_DIM),
+            ));
+            if i < hints.len() - 1 {
+                spans.push(Span::styled(" │ ", Style::default().fg(C_BORDER)));
+            }
+        }
+        
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(C_BORDER))
+            .style(Style::default().bg(C_SURFACE));
+        
+        f.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
+        return;
+    }
+    
     let hints = match app.ui_mode {
         UiMode::ProfileList => vec![
-            ("↑/↓ ", "Pilih profile "),
-            ("Enter ", "Connect "),
-            ("N ", "New "),
-            ("E ", "Edit "),
-            ("D ", "Delete "),
-            ("Q/^C ", "Keluar "),
+            ("↑/↓", "Pilih"),
+            ("Enter/F5", "Connect"),
+            ("F2/N", "New"),
+            ("F3/E", "Edit"),
+            ("F4/D", "Delete"),
+            ("ESC/Ctrl+B", "Back"),
+            ("F1", "Help"),
+            ("Ctrl+Q", "Quit"),
         ],
         UiMode::NewProfile | UiMode::EditProfile => vec![
-            ("Tab ", "Next field "),
-            ("Enter ", "Save "),
-            ("Esc ", "Cancel "),
-            ("Q/^C ", "Keluar "),
+            ("Tab", "Next"),
+            ("Shift+Tab", "Prev"),
+            ("Space", "Toggle"),
+            ("Enter", "Save"),
+            ("ESC/Ctrl+B", "Cancel"),
+            ("F1", "Help"),
         ],
         UiMode::Connect => vec![
-            ("Tab ", "Fokus "),
-            ("Enter ", "Aksi "),
-            ("^P ", "Show/Hide "),
-            ("Back ", "Back to Profiles "),
-            ("Q/^C ", "Keluar "),
+            ("Tab", "Focus"),
+            ("Enter", "Action"),
+            ("Ctrl+P", "Show/Hide"),
+            ("Ctrl+S", "Save"),
+            ("ESC/Ctrl+B", "Back"),
+            ("F1", "Help"),
+            ("Ctrl+Q", "Quit"),
         ],
+        UiMode::Help => vec![],
     };
     
     let mut spans = vec![Span::styled("  ", Style::default())];
@@ -658,11 +879,11 @@ fn render_statusbar(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(C_CYAN).add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled(
-            format!(" {} ", desc),
+            format!("{} ", desc),
             Style::default().fg(C_DIM),
         ));
         if i < hints.len() - 1 {
-            spans.push(Span::styled(" │ ", Style::default().fg(C_BORDER)));
+            spans.push(Span::styled("│ ", Style::default().fg(C_BORDER)));
         }
     }
 
@@ -672,10 +893,7 @@ fn render_statusbar(f: &mut Frame, app: &App, area: Rect) {
         .border_style(Style::default().fg(C_BORDER))
         .style(Style::default().bg(C_SURFACE));
 
-    f.render_widget(
-        Paragraph::new(Line::from(spans)).block(block),
-        area,
-    );
+    f.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
 }
 
 // ─── Floating Notification ───────────────────────────────────────────────────
@@ -695,15 +913,15 @@ fn render_notification(f: &mut Frame, msg: &str, level: &NotifLevel, area: Rect)
     f.render_widget(Clear, notif_area);
 
     let content = format!("{} {}", icon, msg);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(fg))
+        .style(Style::default().bg(bg));
+    
     f.render_widget(
         Paragraph::new(Span::styled(content, Style::default().fg(fg).add_modifier(Modifier::BOLD)))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(fg))
-                    .style(Style::default().bg(bg)),
-            )
+            .block(block)
             .alignment(Alignment::Center),
         notif_area,
     );
@@ -885,18 +1103,16 @@ fn render_token_popup(f: &mut Frame, app: &App, area: Rect) {
     let popup_area = Rect { x: popup_x, y: popup_y, width: popup_w, height: popup_h };
     f.render_widget(Clear, popup_area);
 
-    f.render_widget(
-        Block::default()
-            .title(Span::styled(
-                " ⚡  TWO-FACTOR AUTHENTICATION   ",
-                Style::default().fg(C_ORANGE).add_modifier(Modifier::BOLD),
-            ))
-            .borders(Borders::ALL)
-            .border_type(BorderType::Thick)
-            .border_style(Style::default().fg(C_ORANGE))
-            .style(Style::default().bg(Color::Rgb(20, 14, 5))),
-        popup_area,
-    );
+    let block = Block::default()
+        .title(Span::styled(
+            " ⚡  TWO-FACTOR AUTHENTICATION   ",
+            Style::default().fg(C_ORANGE).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
+        .border_style(Style::default().fg(C_ORANGE))
+        .style(Style::default().bg(Color::Rgb(20, 14, 5)));
+    f.render_widget(block, popup_area);
 
     let inner = Rect {
         x: popup_area.x + 2,
@@ -943,17 +1159,13 @@ fn render_token_popup(f: &mut Frame, app: &App, area: Rect) {
         ])
     };
 
-    f.render_widget(
-        Paragraph::new(input_content)
-            .block(
-                Block::default()
-                    .title(Span::styled(" OTP Token  ", Style::default().fg(C_ORANGE)))
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Thick)
-                    .border_style(Style::default().fg(C_ORANGE)),
-            ),
-        rows[2],
-    );
+    let input_block = Block::default()
+        .title(Span::styled(" OTP Token  ", Style::default().fg(C_ORANGE)))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
+        .border_style(Style::default().fg(C_ORANGE));
+    
+    f.render_widget(Paragraph::new(input_content).block(input_block), rows[2]);
 
     f.render_widget(
         Paragraph::new(Line::from(vec![

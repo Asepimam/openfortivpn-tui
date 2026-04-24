@@ -18,11 +18,11 @@ use config::Config;
 // ─── Entry Point ─────────────────────────────────────────────────────────────
 #[tokio::main]
 async fn main() -> Result<()> {
-    setup_logging()?;
+    let debug_enabled = std::env::args().any(|arg| arg == "-d" || arg == "--debug");
+    setup_logging(debug_enabled)?;
     let cfg = Config::load().unwrap_or_default();
-    let mut app = App::new();
+    let mut app = App::new(debug_enabled);
     
-    // Load profiles from config
     app.load_profiles(cfg.profiles.clone());
     if let Some(selected) = cfg.selected_profile {
         if let Some(idx) = app.profiles.iter().position(|p| p.name == selected) {
@@ -31,7 +31,6 @@ async fn main() -> Result<()> {
         }
     }
     
-    // If no profiles, go to new profile mode
     if app.profiles.is_empty() {
         app.ui_mode = UiMode::NewProfile;
         app.focus = Focus::ProfileName;
@@ -46,7 +45,6 @@ async fn main() -> Result<()> {
 
     let result = run_app(&mut terminal, &mut app).await;
 
-    // Save config before exit
     save_all_config(&app).ok();
 
     disable_raw_mode()?;
@@ -83,6 +81,7 @@ async fn drain_events(app: &mut App) {
         match app.event_rx.try_recv() {
             Ok(event) => match event {
                 AppEvent::LogLine(line) => { app.push_log(line); }
+                AppEvent::DebugLog(line) => { app.push_debug_log(line); }
                 AppEvent::StateChanged(new_state) => {
                     let old = app.vpn_state.clone();
                     app.vpn_state = new_state.clone();
@@ -136,9 +135,29 @@ async fn drain_events(app: &mut App) {
 
 // ─── Key Handler ─────────────────────────────────────────────────────────────
 async fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> Result<()> {
-    // Global quit
+    // Help mode - hanya ESC atau F1 untuk keluar
+    if app.ui_mode == UiMode::Help {
+        if key.code == KeyCode::Esc || key.code == KeyCode::F(1) {
+            app.hide_help();
+        }
+        return Ok(());
+    }
+    
+    // Global F1 untuk help (dari mode apapun)
+    if key.code == KeyCode::F(1) {
+        app.show_help();
+        return Ok(());
+    }
+    
+    // Global quit (Ctrl+C atau Ctrl+Q)
     if matches!((key.modifiers, key.code), (KeyModifiers::CONTROL, KeyCode::Char('c')) | (KeyModifiers::CONTROL, KeyCode::Char('q'))) {
         app.should_quit = true;
+        return Ok(());
+    }
+    
+    // Global back to profile list (ESC atau Ctrl+B)
+    if key.code == KeyCode::Esc || matches!((key.modifiers, key.code), (KeyModifiers::CONTROL, KeyCode::Char('b'))) {
+        app.back_to_profile_list();
         return Ok(());
     }
     
@@ -150,23 +169,12 @@ async fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> Result<()
         return handle_cert_dialog(app, key).await;
     }
     
-    // Back to profile list from connect mode
-    if app.ui_mode == UiMode::Connect && key.code == KeyCode::Esc && !app.has_modal() {
-        if matches!(app.vpn_state, VpnState::Disconnected | VpnState::Error(_)) {
-            app.ui_mode = UiMode::ProfileList;
-            app.focus = Focus::ProfileList;
-            app.push_log("[APP] Kembali ke daftar profile");
-        } else {
-            app.notify("Putuskan VPN terlebih dahulu sebelum keluar", NotifLevel::Warning);
-        }
-        return Ok(());
-    }
-    
     // Mode specific handlers
     match app.ui_mode {
         UiMode::ProfileList => handle_profile_list_mode(app, key).await?,
         UiMode::NewProfile | UiMode::EditProfile => handle_profile_form_mode(app, key).await?,
         UiMode::Connect => handle_connect_mode(app, key).await?,
+        UiMode::Help => {}
     }
     
     Ok(())
@@ -187,16 +195,16 @@ async fn handle_profile_list_mode(app: &mut App, key: crossterm::event::KeyEvent
                 app.select_profile(app.selected_profile_index);
             }
         }
-        KeyCode::Enter => {
-            if let Some(_profile) = app.get_current_profile() {
-                let profile_name = _profile.name.clone();
+        KeyCode::Enter | KeyCode::F(5) => {
+            let profile_name = app.get_current_profile().map(|p| p.name.clone());
+            if let Some(name) = profile_name {
                 app.ui_mode = UiMode::Connect;
                 app.apply_current_profile();
-                app.push_log(&format!("[APP] Menggunakan profile: {}", profile_name));
+                app.push_log(&format!("[APP] Menggunakan profile: {}", name));
                 let _ = do_connect(app).await;
             }
         }
-        KeyCode::Char('n') | KeyCode::Char('N') => {
+        KeyCode::F(2) | KeyCode::Char('n') | KeyCode::Char('N') => {
             app.ui_mode = UiMode::NewProfile;
             app.profile_name.clear();
             app.profile_host.clear();
@@ -208,29 +216,38 @@ async fn handle_profile_list_mode(app: &mut App, key: crossterm::event::KeyEvent
             app.profile_use_sudo_password = false;
             app.editing_profile_name = None;
             app.focus = Focus::ProfileName;
+            app.push_log("[APP] Mode: New Profile (F2/N)");
         }
-        KeyCode::Char('e') | KeyCode::Char('E') => {
-            if let Some(profile) = app.get_current_profile() {
-                let profile_clone = profile.clone();
-                app.ui_mode = UiMode::EditProfile;
-                app.editing_profile_name = Some(profile_clone.name.clone());
-                app.profile_name = profile_clone.name.clone();
-                app.profile_host = profile_clone.host.clone();
-                app.profile_port = profile_clone.port.to_string();
-                app.profile_username = profile_clone.username.clone();
-                app.profile_password = profile_clone.password.clone();
-                app.profile_sudo_password = profile_clone.sudo_password.clone();
-                app.profile_save_password = profile_clone.save_password;
-                app.profile_use_sudo_password = profile_clone.use_sudo_password;
-                app.focus = Focus::ProfileName;
-            }
-        }
-        KeyCode::Char('d') | KeyCode::Char('D') => {
+        KeyCode::F(3) | KeyCode::Char('e') | KeyCode::Char('E') => {
             if let Some(profile) = app.get_current_profile() {
                 let profile_name = profile.name.clone();
-                if let Some(ref confirm) = app.delete_confirmation {
-                    if confirm == &profile_name {
-                        // Confirmed delete
+                let profile_host = profile.host.clone();
+                let profile_port = profile.port.to_string();
+                let profile_username = profile.username.clone();
+                let profile_password = profile.password.clone();
+                let profile_sudo_password = profile.sudo_password.clone();
+                let profile_save_password = profile.save_password;
+                let profile_use_sudo_password = profile.use_sudo_password;
+                
+                app.ui_mode = UiMode::EditProfile;
+                app.editing_profile_name = Some(profile_name.clone());
+                app.profile_name = profile_name.clone();
+                app.profile_host = profile_host;
+                app.profile_port = profile_port;
+                app.profile_username = profile_username;
+                app.profile_password = profile_password;
+                app.profile_sudo_password = profile_sudo_password;
+                app.profile_save_password = profile_save_password;
+                app.profile_use_sudo_password = profile_use_sudo_password;
+                app.focus = Focus::ProfileName;
+                app.push_log(&format!("[APP] Mode: Edit Profile '{}' (F3/E)", &profile_name));
+            }
+        }
+        KeyCode::F(4) | KeyCode::Char('d') | KeyCode::Char('D') => {
+            if let Some(profile) = app.get_current_profile() {
+                let profile_name = profile.name.clone();
+                if app.delete_confirmation.is_some() {
+                    if app.delete_confirmation.as_ref() == Some(&profile_name) {
                         let mut cfg = Config::load().unwrap_or_default();
                         cfg.delete_profile(&profile_name);
                         if let Err(e) = cfg.save() {
@@ -238,11 +255,18 @@ async fn handle_profile_list_mode(app: &mut App, key: crossterm::event::KeyEvent
                         } else {
                             app.profiles = cfg.profiles;
                             app.selected_profile_index = app.selected_profile_index.min(app.profiles.len().saturating_sub(1));
-                            if !app.profiles.is_empty() {
-                                app.select_profile(app.selected_profile_index);
+                            if !app.profiles.is_empty() && app.selected_profile_index < app.profiles.len() {
+                                let idx = app.selected_profile_index;
+                                let new_profile = app.profiles[idx].clone();
+                                app.host = new_profile.host;
+                                app.port = new_profile.port;
+                                app.username = new_profile.username;
+                                app.password = new_profile.password;
+                                app.sudo_password = new_profile.sudo_password;
+                                app.trusted_cert = new_profile.trusted_cert;
                             }
-                            app.notify(format!("Profile '{}' dihapus", profile_name), NotifLevel::Success);
-                            app.push_log(&format!("[APP] Profile '{}' dihapus", profile_name));
+                            app.notify(format!("Profile '{}' dihapus", &profile_name), NotifLevel::Success);
+                            app.push_log(&format!("[APP] Profile '{}' dihapus (F4/D)", &profile_name));
                         }
                         app.delete_confirmation = None;
                     } else {
@@ -250,7 +274,7 @@ async fn handle_profile_list_mode(app: &mut App, key: crossterm::event::KeyEvent
                     }
                 } else {
                     app.delete_confirmation = Some(profile_name.clone());
-                    app.notify(format!("Tekan D lagi untuk hapus '{}'", profile_name), NotifLevel::Warning);
+                    app.notify(format!("Tekan F4 atau D lagi untuk hapus '{}'", &profile_name), NotifLevel::Warning);
                 }
             }
         }
@@ -308,6 +332,7 @@ async fn handle_profile_form_mode(app: &mut App, key: crossterm::event::KeyEvent
             app.ui_mode = UiMode::ProfileList;
             app.focus = Focus::ProfileList;
             app.delete_confirmation = None;
+            app.push_log("[APP] Kembali ke daftar profile");
         }
         _ => {
             match app.focus {
@@ -351,25 +376,26 @@ async fn handle_connect_mode(app: &mut App, key: crossterm::event::KeyEvent) -> 
             if !app.logs.is_empty() { app.log_scroll = app.logs.len() - 1; }
             return Ok(());
         }
-        _ => {}
-    }
-    
-    let current_focus = app.focus.clone();
-    match current_focus {
-        Focus::Host => {
-            // For simplicity, we treat host:port as combined
-            let mut combined = format!("{}:{}", app.host, app.port);
-            handle_text_input(&mut combined, key);
-            let (host, port) = parse_host_port(&combined);
-            app.host = host;
-            app.port = port;
+        _ => {
+            // Handle text input
+            if app.focus == Focus::Host {
+                let mut combined = format!("{}:{}", app.host, app.port);
+                handle_text_input(&mut combined, key);
+                let (host, port) = parse_host_port(&combined);
+                app.host = host;
+                app.port = port;
+            } else if app.focus == Focus::Username {
+                handle_text_input(&mut app.username, key);
+            } else if app.focus == Focus::Password {
+                handle_text_input(&mut app.password, key);
+            } else if app.focus == Focus::SudoPassword {
+                handle_text_input(&mut app.sudo_password, key);
+            } else if app.focus == Focus::Connect && key.code == KeyCode::Enter {
+                do_connect(app).await?;
+            } else if app.focus == Focus::Disconnect && key.code == KeyCode::Enter {
+                do_disconnect(app).await?;
+            }
         }
-        Focus::Username => handle_text_input(&mut app.username, key),
-        Focus::Password => handle_text_input(&mut app.password, key),
-        Focus::SudoPassword => handle_text_input(&mut app.sudo_password, key),
-        Focus::Connect => { if key.code == KeyCode::Enter { do_connect(app).await?; } }
-        Focus::Disconnect => { if key.code == KeyCode::Enter { do_disconnect(app).await?; } }
-        _ => {}
     }
     Ok(())
 }
@@ -393,7 +419,7 @@ async fn handle_token_popup(app: &mut App, key: crossterm::event::KeyEvent) -> R
                 return Ok(());
             }
             
-            app.push_log(format!("[TOKEN] Mengirim token: {}...", &token[..token.len().min(4)]));
+            app.push_log("[TOKEN] Mengirim token OTP...");
             
             let event_tx = app.event_tx.clone();
             let pid_store = app.vpn_pid.clone();
@@ -449,17 +475,16 @@ async fn handle_cert_dialog(app: &mut App, key: crossterm::event::KeyEvent) -> R
     }
     Ok(())
 }
+
 async fn accept_cert_and_reconnect(app: &mut App) -> Result<()> {
     let cert = match app.pending_cert.take() { Some(c) => c, None => return Ok(()) };
     app.push_log(format!("[CERT] ✔ Certificate diterima: {}", cert.subject_cn));
+    app.trusted_cert = Some(cert.hash.clone());
     
-    let cert_hash = cert.hash.clone(); // Clone di sini
-    app.trusted_cert = Some(cert_hash.clone());
-    
-    // Update profile trusted cert
     let profile_name = app.get_current_profile().map(|p| p.name.clone());
     if let Some(name) = profile_name {
-        app.update_profile_trusted_cert(&name, cert_hash);
+        app.update_profile_trusted_cert(&name, &cert.hash);
+        save_all_config(app).ok();
     }
     
     app.vpn_state = VpnState::Connecting;
@@ -470,7 +495,7 @@ async fn accept_cert_and_reconnect(app: &mut App) -> Result<()> {
     let port = app.port;
     let username = app.username.clone();
     let password = app.password.clone();
-    let trusted_cert = Some(cert.hash); // Gunakan cert.hash yang asli
+    let trusted_cert = Some(cert.hash);
     let sudo_pwd = if app.sudo_password.is_empty() { None } else { Some(app.sudo_password.clone()) };
     let event_tx = app.event_tx.clone();
     let pid_store = app.vpn_pid.clone();
@@ -600,8 +625,11 @@ async fn save_profile(app: &mut App) -> Result<()> {
     
     let mut cfg = Config::load().unwrap_or_default();
     
-    if app.ui_mode == UiMode::EditProfile {
-        if let Some(old_name) = &app.editing_profile_name {
+    let is_edit = app.ui_mode == UiMode::EditProfile;
+    let old_name = app.editing_profile_name.clone();
+    
+    if is_edit {
+        if let Some(old_name) = &old_name {
             cfg.delete_profile(old_name);
         }
     }
@@ -613,10 +641,19 @@ async fn save_profile(app: &mut App) -> Result<()> {
         return Ok(());
     }
     
-    // Reload profiles
     app.profiles = cfg.profiles;
     app.selected_profile_index = app.profiles.iter().position(|p| p.name == app.profile_name).unwrap_or(0);
-    app.select_profile(app.selected_profile_index);
+    
+    if app.selected_profile_index < app.profiles.len() {
+        let profile = app.profiles[app.selected_profile_index].clone();
+        app.host = profile.host;
+        app.port = profile.port;
+        app.username = profile.username;
+        app.password = profile.password;
+        app.sudo_password = profile.sudo_password;
+        app.trusted_cert = profile.trusted_cert;
+    }
+    
     app.ui_mode = UiMode::ProfileList;
     app.focus = Focus::ProfileList;
     app.delete_confirmation = None;
@@ -659,9 +696,13 @@ fn parse_host_port(host_port: &str) -> (String, u16) {
 }
 
 // ─── Logging ──────────────────────────────────────────────────────────────────
-fn setup_logging() -> Result<()> {
+fn setup_logging(debug_enabled: bool) -> Result<()> {
+    if !debug_enabled {
+        return Ok(());
+    }
+
     use std::fs::OpenOptions;
-    let log_file = std::env::temp_dir().join("fortivpn-tui.log");
+    let log_file = std::env::temp_dir().join("openfortivpn-tui.log");
     let file = OpenOptions::new().create(true).append(true).open(&log_file)?;
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::sync::Mutex::new(file))

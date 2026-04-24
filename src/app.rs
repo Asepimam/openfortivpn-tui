@@ -44,6 +44,7 @@ pub enum UiMode {
     NewProfile,
     EditProfile,
     Connect,
+    Help,
 }
 
 // ─── Focus Tracking ───────────────────────────────────────────────────────────
@@ -72,12 +73,14 @@ pub enum Focus {
     CertAccept,
     CertDeny,
     TokenInput,
+    HelpPopup,
 }
 
 // ─── Events ───────────────────────────────────────────────────────────────────
 #[derive(Debug)]
 pub enum AppEvent {
     LogLine(String),
+    DebugLog(String),
     StateChanged(VpnState),
     NeedToken,
     CertError(CertInfo),
@@ -96,6 +99,7 @@ pub struct App {
 
     // UI state
     pub ui_mode: UiMode,
+    pub previous_ui_mode: Option<UiMode>,
     pub focus: Focus,
     pub show_password: bool,
     pub vpn_state: VpnState,
@@ -132,6 +136,7 @@ pub struct App {
     // VPN PID
     pub vpn_pid: Arc<Mutex<Option<u32>>>,
     pub waiting_for_input_flag: Arc<Mutex<bool>>,
+    pub debug_enabled: bool,
 
     pub should_quit: bool,
 }
@@ -145,7 +150,7 @@ pub enum NotifLevel {
 }
 
 impl App {
-    pub fn new() -> Self {
+    pub fn new(debug_enabled: bool) -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let waiting_for_input_flag = Arc::new(Mutex::new(false));
 
@@ -157,6 +162,7 @@ impl App {
             sudo_password: String::new(),
             token_input: String::new(),
             ui_mode: UiMode::ProfileList,
+            previous_ui_mode: None,
             focus: Focus::ProfileList,
             show_password: false,
             vpn_state: VpnState::Disconnected,
@@ -183,6 +189,7 @@ impl App {
             event_rx,
             vpn_pid: Arc::new(Mutex::new(None)),
             waiting_for_input_flag,
+            debug_enabled,
             should_quit: false,
         }
     }
@@ -193,6 +200,12 @@ impl App {
         self.logs.push(line);
         if !self.logs.is_empty() {
             self.log_scroll = self.logs.len().saturating_sub(1);
+        }
+    }
+
+    pub fn push_debug_log(&self, line: impl Into<String>) {
+        if self.debug_enabled {
+            tracing::info!("{}", line.into());
         }
     }
 
@@ -214,11 +227,10 @@ impl App {
         matches!(
             self.vpn_state,
             VpnState::WaitingToken | VpnState::WaitingCert
-        )
+        ) || self.ui_mode == UiMode::Help
     }
     
     pub fn cycle_focus_forward(&mut self) {
-        // Saat modal aktif, cycle di dalam modal saja
         if self.vpn_state == VpnState::WaitingCert {
             self.focus = match self.focus {
                 Focus::CertAccept => Focus::CertDeny,
@@ -226,10 +238,8 @@ impl App {
             };
             return;
         }
-        // WaitingToken — tidak ada cycling, fokus tetap di TokenInput
         if self.vpn_state == VpnState::WaitingToken { return; }
 
-        // Di Connect mode
         if self.ui_mode == UiMode::Connect {
             self.focus = match self.focus {
                 Focus::Host => Focus::Username,
@@ -246,7 +256,6 @@ impl App {
     }
 
     pub fn cycle_focus_backward(&mut self) {
-        // Saat modal aktif, cycle di dalam modal saja
         if self.vpn_state == VpnState::WaitingCert {
             self.focus = match self.focus {
                 Focus::CertDeny => Focus::CertAccept,
@@ -256,7 +265,6 @@ impl App {
         }
         if self.vpn_state == VpnState::WaitingToken { return; }
 
-        // Di Connect mode
         if self.ui_mode == UiMode::Connect {
             self.focus = match self.focus {
                 Focus::Host => Focus::Logs,
@@ -272,6 +280,24 @@ impl App {
         }
     }
     
+    pub fn show_help(&mut self) {
+        if self.ui_mode != UiMode::Help {
+            self.previous_ui_mode = Some(self.ui_mode.clone());
+            self.ui_mode = UiMode::Help;
+            self.focus = Focus::HelpPopup;
+        }
+    }
+    
+    pub fn hide_help(&mut self) {
+        if let Some(prev_mode) = self.previous_ui_mode.take() {
+            self.ui_mode = prev_mode;
+            self.focus = Focus::ProfileList;
+        } else {
+            self.ui_mode = UiMode::ProfileList;
+            self.focus = Focus::ProfileList;
+        }
+    }
+    
     pub fn load_profiles(&mut self, profiles: Vec<crate::config::VpnProfile>) {
         self.profiles = profiles;
     }
@@ -279,13 +305,13 @@ impl App {
     pub fn select_profile(&mut self, index: usize) {
         if index < self.profiles.len() {
             self.selected_profile_index = index;
-            let profile = &self.profiles[index];
-            self.host = profile.host.clone();
+            let profile = self.profiles[index].clone();
+            self.host = profile.host;
             self.port = profile.port;
-            self.username = profile.username.clone();
-            self.password = profile.password.clone();
-            self.sudo_password = profile.sudo_password.clone();
-            self.trusted_cert = profile.trusted_cert.clone();
+            self.username = profile.username;
+            self.password = profile.password;
+            self.sudo_password = profile.sudo_password;
+            self.trusted_cert = profile.trusted_cert;
         }
     }
     
@@ -294,32 +320,28 @@ impl App {
     }
     
     pub fn apply_current_profile(&mut self) {
-        if let Some(profile) = self.get_current_profile() {
-            let host = profile.host.clone();
-            let port = profile.port;
-            let username = profile.username.clone();
-            let password = profile.password.clone();
-            let sudo_password = profile.sudo_password.clone();
-            let trusted_cert = profile.trusted_cert.clone();
-            drop(profile);
-            self.host = host;
-            self.port = port;
-            self.username = username;
-            self.password = password;
-            self.sudo_password = sudo_password;
-            self.trusted_cert = trusted_cert;
+        let idx = self.selected_profile_index;
+        if idx < self.profiles.len() {
+            let profile = self.profiles[idx].clone();
+            self.host = profile.host;
+            self.port = profile.port;
+            self.username = profile.username;
+            self.password = profile.password;
+            self.sudo_password = profile.sudo_password;
+            self.trusted_cert = profile.trusted_cert;
         }
     }
     
-    pub fn update_profile_trusted_cert(&mut self, profile_name: &str, cert_hash: String) {
-        // Update di profiles vector
-        if let Some(profile) = self.profiles.iter_mut().find(|p| p.name == profile_name) {
-            profile.trusted_cert = Some(cert_hash.clone());
+    pub fn update_profile_trusted_cert(&mut self, profile_name: &str, cert_hash: &str) {
+        for profile in self.profiles.iter_mut() {
+            if profile.name == profile_name {
+                profile.trusted_cert = Some(cert_hash.to_string());
+                break;
+            }
         }
-        // Update di current profile
         if let Some(profile) = self.get_current_profile() {
             if profile.name == profile_name {
-                self.trusted_cert = Some(cert_hash);
+                self.trusted_cert = Some(cert_hash.to_string());
             }
         }
     }
@@ -334,6 +356,26 @@ impl App {
             if self.log_scroll < max {
                 self.log_scroll += 1;
             }
+        }
+    }
+    
+    pub fn back_to_profile_list(&mut self) {
+        if self.ui_mode == UiMode::Connect && !self.has_modal() {
+            match self.vpn_state {
+                VpnState::Disconnected | VpnState::Error(_) => {
+                    self.ui_mode = UiMode::ProfileList;
+                    self.focus = Focus::ProfileList;
+                    self.push_log("[APP] Kembali ke daftar profile");
+                }
+                _ => {
+                    self.notify("Putuskan VPN terlebih dahulu sebelum keluar", NotifLevel::Warning);
+                }
+            }
+        } else if self.ui_mode == UiMode::NewProfile || self.ui_mode == UiMode::EditProfile {
+            self.ui_mode = UiMode::ProfileList;
+            self.focus = Focus::ProfileList;
+            self.delete_confirmation = None;
+            self.push_log("[APP] Kembali ke daftar profile");
         }
     }
 }

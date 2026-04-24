@@ -1,4 +1,8 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    env,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, Command},
@@ -30,37 +34,43 @@ impl PrivilegeMethod {
     }
 }
 
-pub async fn detect_privilege(tx: &mpsc::UnboundedSender<AppEvent>) -> PrivilegeMethod {
+async fn detect_privilege_for_binary(
+    binary_path: &str,
+    tx: &mpsc::UnboundedSender<AppEvent>,
+) -> PrivilegeMethod {
     if get_uid() == 0 {
-        let _ = tx.send(AppEvent::LogLine("[PRIV] Berjalan sebagai root ✔".into()));
+        let _ = tx.send(AppEvent::DebugLog("[PRIV] Berjalan sebagai root ✔".into()));
         return PrivilegeMethod::AlreadyRoot;
     }
 
     let sudo_nopass = Command::new("sudo")
-        .args(["-n", "true"])
+        .args(["-n", binary_path, "--help"])
         .output()
         .await
         .map(|o| o.status.success())
         .unwrap_or(false);
 
     if sudo_nopass {
-        let _ = tx.send(AppEvent::LogLine("[PRIV] sudo NOPASSWD tersedia ✔".into()));
+        let _ = tx.send(AppEvent::DebugLog(format!(
+            "[PRIV] sudo NOPASSWD tersedia untuk {} ✔",
+            binary_path
+        )));
         return PrivilegeMethod::SudoNoPassword;
     }
 
-    let has_sudo = Command::new("which")
-        .arg("sudo")
+    let has_sudo = Command::new("sudo")
+        .arg("-V")
         .output()
         .await
         .map(|o| o.status.success())
         .unwrap_or(false);
 
     if has_sudo {
-        let _ = tx.send(AppEvent::LogLine("[PRIV] sudo tersedia (butuh password)".into()));
+        let _ = tx.send(AppEvent::DebugLog("[PRIV] sudo tersedia (butuh password)".into()));
         return PrivilegeMethod::SudoWithPassword;
     }
 
-    let _ = tx.send(AppEvent::LogLine("[PRIV] ✖ Tidak ada metode privilege.".into()));
+    let _ = tx.send(AppEvent::DebugLog("[PRIV] ✖ Tidak ada metode privilege.".into()));
     PrivilegeMethod::Unavailable
 }
 
@@ -72,8 +82,47 @@ fn get_uid() -> u32 {
     unsafe { getuid() }
 }
 
+fn find_in_path(binary_name: &str) -> Option<PathBuf> {
+    let path_var = env::var_os("PATH")?;
+
+    env::split_paths(&path_var)
+        .map(|dir| dir.join(binary_name))
+        .find(|candidate| candidate.is_file())
+}
+
+fn resolve_openfortivpn_path() -> Option<PathBuf> {
+    const COMMON_PATHS: [&str; 2] = ["/usr/bin/openfortivpn", "/usr/sbin/openfortivpn"];
+
+    COMMON_PATHS
+        .iter()
+        .map(Path::new)
+        .find(|candidate| candidate.is_file())
+        .map(Path::to_path_buf)
+        .or_else(|| find_in_path("openfortivpn"))
+}
+
+fn detect_install_hint() -> Option<&'static str> {
+    [
+        ("apt", "Install contoh: sudo apt update && sudo apt install openfortivpn"),
+        ("dnf", "Install contoh: sudo dnf install openfortivpn"),
+        ("pacman", "Install contoh: sudo pacman -S openfortivpn"),
+        ("zypper", "Install contoh: sudo zypper install openfortivpn"),
+        ("apk", "Install contoh: sudo apk add openfortivpn"),
+    ]
+    .into_iter()
+    .find_map(|(pkg_manager, hint)| find_in_path(pkg_manager).map(|_| hint))
+}
+
+fn sudoers_hint(binary_path: &str) -> String {
+    format!(
+        "Tambahkan via visudo: <username> ALL=(root) NOPASSWD: {}",
+        binary_path
+    )
+}
+
 // ─── Build Command ────────────────────────────────────────────────────────────
 fn build_command(
+    binary_path: &str,
     host: &str,
     port: u16,
     username: &str,
@@ -92,23 +141,23 @@ fn build_command(
     }
 
     let mut cmd = match method {
-        PrivilegeMethod::AlreadyRoot => Command::new("openfortivpn"),
+        PrivilegeMethod::AlreadyRoot => Command::new(binary_path),
         PrivilegeMethod::SudoNoPassword => {
             let mut c = Command::new("sudo");
             c.arg("-n");
-            c.arg("openfortivpn");
+            c.arg(binary_path);
             c
         }
         PrivilegeMethod::SudoWithPassword => {
             let mut c = Command::new("sudo");
             c.arg("-S");
-            c.arg("openfortivpn");
+            c.arg(binary_path);
             c
         }
         PrivilegeMethod::Pkexec | PrivilegeMethod::Unavailable => {
             let mut c = Command::new("sudo");
             c.arg("-n");
-            c.arg("openfortivpn");
+            c.arg(binary_path);
             c
         }
     };
@@ -144,20 +193,54 @@ pub async fn connect(
         if trusted_cert.is_some() { " (cert trusted)" } else { "" }
     )));
 
-    let method = detect_privilege(&event_tx).await;
-
-    if method == PrivilegeMethod::Unavailable {
-        bail!("openfortivpn memerlukan root. Setup sudoers terlebih dahulu.");
+    if let Some(hint) = detect_install_hint() {
+        let _ = event_tx.send(AppEvent::DebugLog(format!(
+            "[VPN] Hint install openfortivpn: {}",
+            hint
+        )));
     }
 
-    let _ = event_tx.send(AppEvent::LogLine(format!("[PRIV] Metode: {}", method.label())));
+    let binary_path = resolve_openfortivpn_path().ok_or_else(|| {
+        let mut message = String::from(
+            "Binary openfortivpn tidak ditemukan. Install openfortivpn terlebih dahulu (contoh path: /usr/bin/openfortivpn atau /usr/sbin/openfortivpn).",
+        );
+        if let Some(hint) = detect_install_hint() {
+            message.push(' ');
+            message.push_str(hint);
+        }
+        anyhow::anyhow!(message)
+    })?;
 
-    let mut cmd = build_command(host, port, username, trusted_cert.as_deref(), &method);
+    let binary_path_str = binary_path.to_string_lossy().into_owned();
+    let _ = event_tx.send(AppEvent::DebugLog(format!(
+        "[VPN] Binary openfortivpn terdeteksi di {}",
+        binary_path_str
+    )));
+
+    let method = detect_privilege_for_binary(&binary_path_str, &event_tx).await;
+
+    if method == PrivilegeMethod::Unavailable {
+        bail!(
+            "openfortivpn memerlukan root, tapi akses sudo tidak tersedia. {}",
+            sudoers_hint(&binary_path_str)
+        );
+    }
+
+    let _ = event_tx.send(AppEvent::DebugLog(format!("[PRIV] Metode: {}", method.label())));
+
+    let mut cmd = build_command(
+        &binary_path_str,
+        host,
+        port,
+        username,
+        trusted_cert.as_deref(),
+        &method,
+    );
     let mut child: Child = cmd.spawn()?;
 
     if let Some(pid) = child.id() {
         *pid_store.lock().unwrap() = Some(pid);
-        let _ = event_tx.send(AppEvent::LogLine(format!("[VPN] PID: {}", pid)));
+        let _ = event_tx.send(AppEvent::DebugLog(format!("[VPN] PID: {}", pid)));
     }
 
     let mut stdin = match child.stdin.take() {
@@ -222,7 +305,7 @@ pub async fn connect(
 }
 
 async fn read_stream(
-    mut stream: impl tokio::io::AsyncRead + Send + Unpin + 'static,
+    stream: impl tokio::io::AsyncRead + Send + Unpin + 'static,
     tx: mpsc::UnboundedSender<AppEvent>,
     _is_stderr: bool,
     cert_buf: Arc<Mutex<CertBuffer>>,
@@ -243,7 +326,7 @@ async fn read_stream(
         
         if line_lower.contains("connected to gateway") && !*gateway_connected.lock().unwrap() {
             *gateway_connected.lock().unwrap() = true;
-            let _ = tx.send(AppEvent::LogLine(format!("[VPN] {}", line.trim())));
+            let _ = tx.send(AppEvent::DebugLog(format!("[VPN] {}", line.trim())));
             
             if !*token_requested.lock().unwrap() {
                 *token_requested.lock().unwrap() = true;
@@ -256,7 +339,7 @@ async fn read_stream(
         }
         
         if line_lower.contains("tunnel is up") {
-            let _ = tx.send(AppEvent::LogLine(format!("[VPN] ✅ {}", line.trim())));
+            let _ = tx.send(AppEvent::DebugLog(format!("[VPN] ✅ {}", line.trim())));
             let _ = tx.send(AppEvent::StateChanged(VpnState::Connected));
             *waiting_flag.lock().unwrap() = false;
             continue;
@@ -270,7 +353,7 @@ async fn read_stream(
             let prefix = if line_lower.contains("error") { "[ERR] " }
                 else if line_lower.contains("warn") { "[WARN] " }
                 else { "[VPN] " };
-            let _ = tx.send(AppEvent::LogLine(format!("{}{}", prefix, line.trim())));
+            let _ = tx.send(AppEvent::DebugLog(format!("{}{}", prefix, line.trim())));
         }
     }
 }
@@ -287,7 +370,7 @@ async fn wait_for_process(
 
     let cert_info = cert_buf.lock().unwrap().try_emit();
     if let Some(info) = cert_info {
-        let _ = tx.send(AppEvent::LogLine(format!("[CERT] Untrusted: CN={}", info.subject_cn)));
+        let _ = tx.send(AppEvent::DebugLog(format!("[CERT] Untrusted: CN={}", info.subject_cn)));
         let _ = tx.send(AppEvent::CertError(info));
         return;
     }
@@ -297,20 +380,20 @@ async fn wait_for_process(
     match status {
         Ok(exit) => {
             if was_waiting {
-                let _ = tx.send(AppEvent::LogLine("[VPN] ⚠️ Koneksi terputus saat menunggu token".into()));
+                let _ = tx.send(AppEvent::DebugLog("[VPN] ⚠️ Koneksi terputus saat menunggu token".into()));
                 *waiting_flag.lock().unwrap() = false;
                 let _ = tx.send(AppEvent::StateChanged(VpnState::Disconnected));
             } else if exit.success() {
-                let _ = tx.send(AppEvent::LogLine("[VPN] Koneksi ditutup".into()));
+                let _ = tx.send(AppEvent::DebugLog("[VPN] Koneksi ditutup".into()));
                 let _ = tx.send(AppEvent::StateChanged(VpnState::Disconnected));
             } else {
                 let code = exit.code().unwrap_or(-1);
-                let _ = tx.send(AppEvent::LogLine(format!("[VPN] Exit code: {}", code)));
+                let _ = tx.send(AppEvent::DebugLog(format!("[VPN] Exit code: {}", code)));
                 let _ = tx.send(AppEvent::StateChanged(VpnState::Disconnected));
             }
         }
         Err(e) => {
-            let _ = tx.send(AppEvent::LogLine(format!("[VPN] Error: {}", e)));
+            let _ = tx.send(AppEvent::DebugLog(format!("[VPN] Error: {}", e)));
             let _ = tx.send(AppEvent::StateChanged(VpnState::Disconnected));
         }
     }
@@ -328,7 +411,6 @@ pub async fn send_token(
         
         let token_line = format!("{}\n", token);
         
-        // Try multiple methods with sudo
         let methods = vec![
             format!("echo '{}' | sudo tee /proc/{}/fd/0 > /dev/null 2>&1", token, pid),
             format!("printf '{}' | sudo tee /proc/{}/fd/0 > /dev/null 2>&1", token, pid),
@@ -350,7 +432,6 @@ pub async fn send_token(
             }
         }
         
-        // Last resort: write to temp file
         let temp_file = "/tmp/fortivpn_token.txt";
         let _ = tokio::fs::write(temp_file, token_line.as_bytes()).await;
         let output = Command::new("sh")
