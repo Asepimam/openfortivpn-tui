@@ -17,7 +17,6 @@ use crate::app::{AppEvent, CertInfo, VpnState};
 pub enum PrivilegeMethod {
     AlreadyRoot,
     SudoNoPassword,
-    Pkexec,
     SudoWithPassword,
     Unavailable,
 }
@@ -27,7 +26,6 @@ impl PrivilegeMethod {
         match self {
             PrivilegeMethod::AlreadyRoot => "root (langsung)",
             PrivilegeMethod::SudoNoPassword => "sudo NOPASSWD",
-            PrivilegeMethod::Pkexec => "pkexec (polkit)",
             PrivilegeMethod::SudoWithPassword => "sudo -S (dengan password)",
             PrivilegeMethod::Unavailable => "tidak tersedia",
         }
@@ -154,7 +152,7 @@ fn build_command(
             c.arg(binary_path);
             c
         }
-        PrivilegeMethod::Pkexec | PrivilegeMethod::Unavailable => {
+        PrivilegeMethod::Unavailable => {
             let mut c = Command::new("sudo");
             c.arg("-n");
             c.arg(binary_path);
