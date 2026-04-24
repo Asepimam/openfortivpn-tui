@@ -76,21 +76,10 @@ impl Config {
     pub fn add_profile(&mut self, profile: VpnProfile) {
         self.profiles.push(profile);
     }
-    
-    pub fn update_profile(&mut self, name: &str, profile: VpnProfile) {
-        if let Some(idx) = self.profiles.iter().position(|p| p.name == name) {
-            self.profiles[idx] = profile;
-        }
-    }
-    
     pub fn delete_profile(&mut self, name: &str) {
         self.profiles.retain(|p| p.name != name);
         if self.selected_profile.as_deref() == Some(name) {
             self.selected_profile = None;
         }
-    }
-    
-    pub fn get_profile(&self, name: &str) -> Option<&VpnProfile> {
-        self.profiles.iter().find(|p| p.name == name)
     }
 }
