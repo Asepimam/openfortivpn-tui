@@ -528,7 +528,7 @@ pub async fn send_token(
             }
         }
 
-        let temp_file = "/tmp/fortivpn_token.txt";
+        let temp_file = format!("/tmp/fortivpn_token_{}.txt", pid);
         let _ = tokio::fs::write(temp_file, token_line.as_bytes()).await;
         let output = Command::new("sh")
             .arg("-c")
