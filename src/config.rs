@@ -53,29 +53,34 @@ impl Config {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        
+
         let to_save = Config {
-            profiles: self.profiles.iter().map(|p| {
-                if p.save_password {
-                    p.clone()
-                } else {
-                    VpnProfile {
-                        password: String::new(),
-                        sudo_password: String::new(),
-                        ..p.clone()
+            profiles: self
+                .profiles
+                .iter()
+                .map(|p| {
+                    if p.save_password {
+                        p.clone()
+                    } else {
+                        VpnProfile {
+                            password: String::new(),
+                            sudo_password: String::new(),
+                            ..p.clone()
+                        }
                     }
-                }
-            }).collect(),
+                })
+                .collect(),
             selected_profile: self.selected_profile.clone(),
         };
-        
+
         std::fs::write(&path, toml::to_string_pretty(&to_save)?)?;
         Ok(())
     }
-    
+
     pub fn add_profile(&mut self, profile: VpnProfile) {
         self.profiles.push(profile);
     }
+
     pub fn delete_profile(&mut self, name: &str) {
         self.profiles.retain(|p| p.name != name);
         if self.selected_profile.as_deref() == Some(name) {
