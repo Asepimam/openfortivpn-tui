@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -41,8 +41,10 @@ impl Config {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let content = std::fs::read_to_string(&path)?;
-        Ok(toml::from_str(&content)?)
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("Gagal membaca file konfigurasi {}", path.display()))?;
+        toml::from_str(&content)
+            .with_context(|| format!("Format konfigurasi tidak valid di {}", path.display()))
     }
 
     pub fn save(&self) -> Result<()> {

@@ -10,6 +10,18 @@ use crate::{
     vpn,
 };
 
+fn load_config_or_notify(app: &mut App, action: &str) -> Option<Config> {
+    match Config::load() {
+        Ok(cfg) => Some(cfg),
+        Err(err) => {
+            let message = format!("{action} dibatalkan: {err}");
+            app.notify(message.clone(), NotifLevel::Error);
+            app.push_log(format!("[APP] {message}"));
+            None
+        }
+    }
+}
+
 pub async fn handle_profile_list_mode(app: &mut App, key: KeyEvent) -> Result<()> {
     match key.code {
         KeyCode::Up if app.selected_profile_index > 0 => {
@@ -54,7 +66,10 @@ pub async fn handle_profile_list_mode(app: &mut App, key: KeyEvent) -> Result<()
                 let profile_name = profile.name.clone();
                 if app.delete_confirmation.is_some() {
                     if app.delete_confirmation.as_ref() == Some(&profile_name) {
-                        let mut cfg = Config::load().unwrap_or_default();
+                        let Some(mut cfg) = load_config_or_notify(app, "Hapus profile") else {
+                            app.delete_confirmation = None;
+                            return Ok(());
+                        };
                         cfg.delete_profile(&profile_name);
                         if let Err(e) = cfg.save() {
                             app.notify(format!("Gagal hapus: {}", e), NotifLevel::Error);
@@ -735,7 +750,9 @@ async fn save_profile(app: &mut App) -> Result<()> {
         },
     };
 
-    let mut cfg = Config::load().unwrap_or_default();
+    let Some(mut cfg) = load_config_or_notify(app, "Simpan profile") else {
+        return Ok(());
+    };
     let is_edit = app.ui_mode == UiMode::EditProfile;
     let old_name = app.editing_profile_name.clone();
 
