@@ -795,6 +795,7 @@ dependencies = [
  "anyhow",
  "crossterm 0.28.1",
  "directories",
+ "libc",
  "ratatui",
  "serde",
  "thiserror 1.0.69",

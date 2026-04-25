@@ -18,7 +18,7 @@ use crate::{
 pub async fn run() -> Result<()> {
     let debug_enabled = std::env::args().any(|arg| arg == "-d" || arg == "--debug");
     actions::setup_logging(debug_enabled)?;
-    let cfg = Config::load().unwrap_or_default();
+    let cfg = Config::load()?;
     let mut app = App::new(debug_enabled);
 
     app.load_profiles(cfg.profiles.clone());

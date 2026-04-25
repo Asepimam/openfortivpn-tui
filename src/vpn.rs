@@ -1,5 +1,6 @@
 use crate::app::{AppEvent, CertInfo, VpnState};
 use anyhow::{Result, bail};
+use libc::{ESRCH, SIGKILL, SIGTERM, c_int, kill};
 use std::{
     env,
     path::{Path, PathBuf},
@@ -82,6 +83,21 @@ unsafe extern "C" {
 
 fn get_uid() -> u32 {
     unsafe { getuid() }
+}
+
+fn send_signal(pid: u32, signal: c_int) -> bool {
+    unsafe { kill(pid as i32, signal) == 0 }
+}
+
+fn process_exists(pid: u32) -> bool {
+    let result = unsafe { kill(pid as i32, 0) };
+    if result == 0 {
+        return true;
+    }
+
+    std::io::Error::last_os_error()
+        .raw_os_error()
+        .is_some_and(|code| code != ESRCH)
 }
 
 fn find_in_path(binary_name: &str) -> Option<PathBuf> {
@@ -510,8 +526,24 @@ pub async fn send_token(
             stdin.write_all(token_line.as_bytes()).await?;
         }
 
-        let output = child.wait_with_output().await?;
-        if output.status.success() {
+        let temp_file = format!("/tmp/fortivpn_token_{}.txt", pid);
+
+        let _ = tokio::fs::write(&temp_file, token_line.as_bytes()).await;
+
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "sudo cat {} > /proc/{}/fd/0 2>/dev/null",
+                &temp_file, pid
+            ))
+            .output()
+            .await;
+
+        let _ = tokio::fs::remove_file(&temp_file).await;
+
+        if let Ok(o) = output
+            && o.status.success()
+        {
             let _ = event_tx.send(AppEvent::LogLine {
                 session_id,
                 line: "[TOKEN] ✅ Token berhasil dikirim".into(),
@@ -626,25 +658,11 @@ pub async fn disconnect(
             session_id,
             line: format!("[VPN] Menghentikan PID {}...", pid),
         });
-        let _ = Command::new("kill")
-            .arg("-TERM")
-            .arg(pid.to_string())
-            .output()
-            .await;
+        let _ = send_signal(pid, SIGTERM);
         tokio::time::sleep(Duration::from_secs(1)).await;
-        let alive = Command::new("kill")
-            .arg("-0")
-            .arg(pid.to_string())
-            .output()
-            .await
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+        let alive = process_exists(pid);
         if alive {
-            let _ = Command::new("kill")
-                .arg("-KILL")
-                .arg(pid.to_string())
-                .output()
-                .await;
+            let _ = send_signal(pid, SIGKILL);
             let _ = event_tx.send(AppEvent::LogLine {
                 session_id,
                 line: "[VPN] Force kill dengan SIGKILL".into(),
