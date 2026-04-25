@@ -545,16 +545,19 @@ pub async fn send_token(
         }
 
         let temp_file = format!("/tmp/fortivpn_token_{}.txt", pid);
-        let _ = tokio::fs::write(temp_file, token_line.as_bytes()).await;
+
+        let _ = tokio::fs::write(&temp_file, token_line.as_bytes()).await;
+
         let output = Command::new("sh")
             .arg("-c")
             .arg(format!(
                 "sudo cat {} > /proc/{}/fd/0 2>/dev/null",
-                temp_file, pid
+                &temp_file, pid
             ))
             .output()
             .await;
-        let _ = tokio::fs::remove_file(temp_file).await;
+
+        let _ = tokio::fs::remove_file(&temp_file).await;
 
         if let Ok(o) = output
             && o.status.success()
