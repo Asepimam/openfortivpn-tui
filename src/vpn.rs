@@ -498,54 +498,23 @@ pub async fn send_token(
         });
 
         let token_line = format!("{}\n", token);
+        let mut child = Command::new("sudo")
+            .arg("tee")
+            .arg(format!("/proc/{}/fd/0", pid))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
 
-        let methods = vec![
-            format!(
-                "echo '{}' | sudo tee /proc/{}/fd/0 > /dev/null 2>&1",
-                token, pid
-            ),
-            format!(
-                "printf '{}' | sudo tee /proc/{}/fd/0 > /dev/null 2>&1",
-                token, pid
-            ),
-            format!(
-                "sudo sh -c \"echo '{}' > /proc/{}/fd/0\" 2>/dev/null",
-                token, pid
-            ),
-        ];
-
-        for method in methods {
-            let output = Command::new("sh").arg("-c").arg(&method).output().await;
-
-            if let Ok(o) = output
-                && o.status.success()
-            {
-                let _ = event_tx.send(AppEvent::LogLine {
-                    session_id,
-                    line: "[TOKEN] ✅ Token berhasil dikirim".into(),
-                });
-                return Ok(());
-            }
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(token_line.as_bytes()).await?;
         }
 
-        let temp_file = format!("/tmp/fortivpn_token_{}.txt", pid);
-        let _ = tokio::fs::write(temp_file, token_line.as_bytes()).await;
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "sudo cat {} > /proc/{}/fd/0 2>/dev/null",
-                temp_file, pid
-            ))
-            .output()
-            .await;
-        let _ = tokio::fs::remove_file(temp_file).await;
-
-        if let Ok(o) = output
-            && o.status.success()
-        {
+        let output = child.wait_with_output().await?;
+        if output.status.success() {
             let _ = event_tx.send(AppEvent::LogLine {
                 session_id,
-                line: "[TOKEN] ✅ Token dikirim via file".into(),
+                line: "[TOKEN] ✅ Token berhasil dikirim".into(),
             });
             return Ok(());
         }
