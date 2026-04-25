@@ -1,7 +1,7 @@
-mod screens;
 mod popups;
+mod screens;
 mod theme;
-mod views;
+pub mod views;
 mod widgets;
 
-pub use screens::render;
+pub use views::render;

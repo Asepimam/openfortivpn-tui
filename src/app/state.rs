@@ -1,11 +1,7 @@
 use std::sync::{Arc, Mutex};
-
 use tokio::sync::mpsc;
 
-use crate::config::VpnProfile;
-
-use super::ProfileForm;
-
+// ─── VPN Connection State ─────────────────────────────────────────────────────
 #[derive(Debug, Clone, PartialEq)]
 pub enum VpnState {
     Disconnected,
@@ -31,15 +27,16 @@ impl VpnState {
     }
 }
 
+// ─── Certificate Info ─────────────────────────────────────────────────────────
 #[derive(Debug, Clone, Default)]
 pub struct CertInfo {
     pub hash: String,
     pub subject_cn: String,
     pub subject_org: String,
     pub issuer_cn: String,
-    pub raw_lines: Vec<String>,
 }
 
+// ─── UI Mode ─────────────────────────────────────────────────────────────────
 #[derive(Debug, Clone, PartialEq)]
 pub enum UiMode {
     ProfileList,
@@ -49,9 +46,14 @@ pub enum UiMode {
     Help,
 }
 
+// ─── Focus Tracking ───────────────────────────────────────────────────────────
 #[derive(Debug, Clone, PartialEq)]
 pub enum Focus {
+    // Profile list mode
     ProfileList,
+    ProfileItem(usize),
+
+    // Form mode
     ProfileName,
     Host,
     Port,
@@ -60,99 +62,136 @@ pub enum Focus {
     SudoPassword,
     SavePassword,
     UseSudoPassword,
+
+    // Action buttons
     Connect,
     Disconnect,
     Logs,
+
+    // Modal dialogs
     CertAccept,
     CertDeny,
+    ActionConfirmAccept,
+    ActionConfirmDeny,
     TokenInput,
     HelpPopup,
 }
 
-#[derive(Debug)]
-pub enum AppEvent {
-    LogLine(String),
-    DebugLog(String),
-    StateChanged(VpnState),
-    NeedToken,
-    CertError(CertInfo),
+#[derive(Debug, Clone)]
+pub enum PendingAction {
+    DisconnectActive,
+    DisconnectAll,
+    CloseActive,
+    CloseAllIdle,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct ConnectionForm {
+impl PendingAction {
+    pub fn title(&self) -> &'static str {
+        match self {
+            PendingAction::DisconnectActive => "DISCONNECT SESSION",
+            PendingAction::DisconnectAll => "DISCONNECT ALL SESSIONS",
+            PendingAction::CloseActive => "CLOSE SESSION TAB",
+            PendingAction::CloseAllIdle => "CLOSE IDLE TABS",
+        }
+    }
+}
+
+// ─── Events ───────────────────────────────────────────────────────────────────
+#[derive(Debug)]
+pub enum AppEvent {
+    LogLine { session_id: u64, line: String },
+    DebugLog(String),
+    StateChanged { session_id: u64, state: VpnState },
+    NeedToken(u64),
+    CertError { session_id: u64, cert: CertInfo },
+}
+
+pub struct ConnectionSession {
+    pub id: u64,
+    pub profile_name: String,
     pub host: String,
     pub port: u16,
     pub username: String,
     pub password: String,
     pub sudo_password: String,
     pub token_input: String,
+    pub vpn_state: VpnState,
+    pub logs: Vec<String>,
+    pub log_scroll: usize,
+    pub pending_cert: Option<CertInfo>,
     pub trusted_cert: Option<String>,
+    pub vpn_pid: Arc<Mutex<Option<u32>>>,
+    pub waiting_for_input_flag: Arc<Mutex<bool>>,
 }
 
-impl ConnectionForm {
-    pub fn new() -> Self {
+impl ConnectionSession {
+    pub fn new(id: u64, profile: &crate::config::VpnProfile) -> Self {
         Self {
-            port: 443,
-            ..Self::default()
+            id,
+            profile_name: profile.name.clone(),
+            host: profile.host.clone(),
+            port: profile.port,
+            username: profile.username.clone(),
+            password: profile.password.clone(),
+            sudo_password: profile.sudo_password.clone(),
+            token_input: String::new(),
+            vpn_state: VpnState::Disconnected,
+            logs: Vec::new(),
+            log_scroll: 0,
+            pending_cert: None,
+            trusted_cert: profile.trusted_cert.clone(),
+            vpn_pid: Arc::new(Mutex::new(None)),
+            waiting_for_input_flag: Arc::new(Mutex::new(false)),
         }
     }
 
-    pub fn host_port_display(&self) -> String {
-        format!("{}:{}", self.host, self.port)
-    }
-
-    pub fn update_host_port(&mut self, host_port: &str) {
-        let (host, port) = parse_host_port(host_port);
-        self.host = host;
-        self.port = port;
-    }
-
-    pub fn apply_profile(&mut self, profile: &VpnProfile) {
-        self.host = profile.host.clone();
-        self.port = profile.port;
-        self.username = profile.username.clone();
-        self.password = profile.password.clone();
-        self.sudo_password = profile.sudo_password.clone();
-        self.trusted_cert = profile.trusted_cert.clone();
-    }
-
-    pub fn is_ready_for_connect(&self) -> bool {
-        !self.host.is_empty() && !self.username.is_empty() && !self.password.is_empty()
-    }
-
-    pub fn sudo_password_option(&self) -> Option<String> {
-        (!self.sudo_password.is_empty()).then(|| self.sudo_password.clone())
+    pub fn push_log(&mut self, line: impl Into<String>) {
+        let line = line.into();
+        self.logs.push(line);
+        if !self.logs.is_empty() {
+            self.log_scroll = self.logs.len().saturating_sub(1);
+        }
     }
 }
 
-#[derive(Debug)]
-pub struct RuntimeState {
-    pub vpn_pid: Arc<Mutex<Option<u32>>>,
-    pub waiting_for_input_flag: Arc<Mutex<bool>>,
-    pub debug_enabled: bool,
-    pub should_quit: bool,
-}
-
-#[derive(Debug)]
+// ─── App State ────────────────────────────────────────────────────────────────
 pub struct App {
-    pub connection: ConnectionForm,
-    pub profile_form: ProfileForm,
+    // UI state
     pub ui_mode: UiMode,
     pub previous_ui_mode: Option<UiMode>,
     pub focus: Focus,
     pub show_password: bool,
-    pub vpn_state: VpnState,
     pub logs: Vec<String>,
     pub log_scroll: usize,
     pub notification: Option<(String, NotifLevel)>,
     pub notification_ttl: u8,
-    pub profiles: Vec<VpnProfile>,
+    pub pending_action: Option<PendingAction>,
+    pub sessions: Vec<ConnectionSession>,
+    pub active_session_index: Option<usize>,
+    pub next_session_id: u64,
+
+    // Profile management
+    pub profiles: Vec<crate::config::VpnProfile>,
     pub selected_profile_index: usize,
     pub delete_confirmation: Option<String>,
-    pub pending_cert: Option<CertInfo>,
+
+    // Form for new/edit profile
+    pub profile_name: String,
+    pub profile_host: String,
+    pub profile_port: String,
+    pub profile_username: String,
+    pub profile_password: String,
+    pub profile_sudo_password: String,
+    pub profile_save_password: bool,
+    pub profile_use_sudo_password: bool,
+    pub editing_profile_name: Option<String>,
+
+    // Channel
     pub event_tx: mpsc::UnboundedSender<AppEvent>,
     pub event_rx: mpsc::UnboundedReceiver<AppEvent>,
-    pub runtime: RuntimeState,
+    pub debug_enabled: bool,
+
+    pub should_quit: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -168,43 +207,52 @@ impl App {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
         Self {
-            connection: ConnectionForm::new(),
-            profile_form: ProfileForm::new(),
             ui_mode: UiMode::ProfileList,
             previous_ui_mode: None,
             focus: Focus::ProfileList,
             show_password: false,
-            vpn_state: VpnState::Disconnected,
             logs: Vec::new(),
             log_scroll: 0,
             notification: None,
             notification_ttl: 0,
+            pending_action: None,
+            sessions: Vec::new(),
+            active_session_index: None,
+            next_session_id: 1,
             profiles: Vec::new(),
             selected_profile_index: 0,
             delete_confirmation: None,
-            pending_cert: None,
+            profile_name: String::new(),
+            profile_host: String::new(),
+            profile_port: String::from("443"),
+            profile_username: String::new(),
+            profile_password: String::new(),
+            profile_sudo_password: String::new(),
+            profile_save_password: false,
+            profile_use_sudo_password: false,
+            editing_profile_name: None,
             event_tx,
             event_rx,
-            runtime: RuntimeState {
-                vpn_pid: Arc::new(Mutex::new(None)),
-                waiting_for_input_flag: Arc::new(Mutex::new(false)),
-                debug_enabled,
-                should_quit: false,
-            },
+            debug_enabled,
+            should_quit: false,
         }
     }
 
     pub fn push_log(&mut self, line: impl Into<String>) {
         let line = line.into();
         tracing::info!("{}", line);
-        self.logs.push(line);
-        if !self.logs.is_empty() {
-            self.log_scroll = self.logs.len().saturating_sub(1);
+        if let Some(session) = self.active_session_mut() {
+            session.push_log(line);
+        } else {
+            self.logs.push(line);
+            if !self.logs.is_empty() {
+                self.log_scroll = self.logs.len().saturating_sub(1);
+            }
         }
     }
 
     pub fn push_debug_log(&self, line: impl Into<String>) {
-        if self.runtime.debug_enabled {
+        if self.debug_enabled {
             tracing::info!("{}", line.into());
         }
     }
@@ -224,101 +272,132 @@ impl App {
     }
 
     pub fn has_modal(&self) -> bool {
-        matches!(self.vpn_state, VpnState::WaitingToken | VpnState::WaitingCert)
-            || self.ui_mode == UiMode::Help
+        matches!(
+            self.active_session_state(),
+            VpnState::WaitingToken | VpnState::WaitingCert
+        ) || self.ui_mode == UiMode::Help
+            || self.pending_action.is_some()
     }
 
-    pub fn show_help(&mut self) {
-        if self.ui_mode != UiMode::Help {
-            self.previous_ui_mode = Some(self.ui_mode.clone());
-            self.ui_mode = UiMode::Help;
-            self.focus = Focus::HelpPopup;
+    pub fn request_action_confirmation(&mut self, action: PendingAction) {
+        self.pending_action = Some(action);
+        self.focus = Focus::ActionConfirmAccept;
+    }
+
+    pub fn clear_action_confirmation(&mut self) {
+        self.pending_action = None;
+        self.focus = Focus::Connect;
+    }
+
+    pub fn active_session(&self) -> Option<&ConnectionSession> {
+        self.active_session_index
+            .and_then(|idx| self.sessions.get(idx))
+    }
+
+    pub fn active_session_mut(&mut self) -> Option<&mut ConnectionSession> {
+        self.active_session_index
+            .and_then(move |idx| self.sessions.get_mut(idx))
+    }
+
+    pub fn active_session_state(&self) -> VpnState {
+        self.active_session()
+            .map(|s| s.vpn_state.clone())
+            .unwrap_or(VpnState::Disconnected)
+    }
+
+    pub fn active_session_label(&self) -> String {
+        self.active_session()
+            .map(|s| s.profile_name.clone())
+            .unwrap_or_else(|| "NO SESSION".into())
+    }
+
+    pub fn find_session_index_by_id(&self, session_id: u64) -> Option<usize> {
+        self.sessions.iter().position(|s| s.id == session_id)
+    }
+
+    pub fn find_session_by_profile_name(&self, profile_name: &str) -> Option<usize> {
+        self.sessions
+            .iter()
+            .position(|s| s.profile_name == profile_name)
+    }
+
+    pub fn activate_session(&mut self, index: usize) {
+        if index < self.sessions.len() {
+            self.active_session_index = Some(index);
+            self.ui_mode = UiMode::Connect;
+            self.focus = Focus::Connect;
         }
     }
 
-    pub fn hide_help(&mut self) {
-        if let Some(prev_mode) = self.previous_ui_mode.take() {
-            self.ui_mode = prev_mode;
-        } else {
+    pub fn activate_next_session(&mut self) {
+        if self.sessions.is_empty() {
+            return;
+        }
+        let next = match self.active_session_index {
+            Some(idx) => (idx + 1) % self.sessions.len(),
+            None => 0,
+        };
+        self.activate_session(next);
+    }
+
+    pub fn activate_prev_session(&mut self) {
+        if self.sessions.is_empty() {
+            return;
+        }
+        let prev = match self.active_session_index {
+            Some(0) | None => self.sessions.len() - 1,
+            Some(idx) => idx.saturating_sub(1),
+        };
+        self.activate_session(prev);
+    }
+
+    pub fn ensure_session_for_selected_profile(&mut self) -> Option<u64> {
+        let profile = self.get_current_profile()?.clone();
+        if let Some(idx) = self.find_session_by_profile_name(&profile.name) {
+            self.activate_session(idx);
+            return self.sessions.get(idx).map(|s| s.id);
+        }
+
+        let session_id = self.next_session_id;
+        self.next_session_id += 1;
+        self.sessions
+            .push(ConnectionSession::new(session_id, &profile));
+        let idx = self.sessions.len().saturating_sub(1);
+        self.activate_session(idx);
+        Some(session_id)
+    }
+
+    pub fn close_active_session(&mut self) {
+        let Some(idx) = self.active_session_index else {
+            return;
+        };
+        self.sessions.remove(idx);
+        if self.sessions.is_empty() {
+            self.active_session_index = None;
             self.ui_mode = UiMode::ProfileList;
-        }
-        self.focus = Focus::ProfileList;
-    }
-
-    pub fn load_profiles(&mut self, profiles: Vec<VpnProfile>) {
-        self.profiles = profiles;
-    }
-
-    pub fn get_current_profile(&self) -> Option<&VpnProfile> {
-        self.profiles.get(self.selected_profile_index)
-    }
-
-    pub fn select_profile(&mut self, index: usize) {
-        if index < self.profiles.len() {
-            self.selected_profile_index = index;
-            let profile = self.profiles[index].clone();
-            self.connection.apply_profile(&profile);
+            self.focus = Focus::ProfileList;
+        } else {
+            let new_idx = idx.min(self.sessions.len().saturating_sub(1));
+            self.activate_session(new_idx);
         }
     }
 
-    pub fn apply_current_profile(&mut self) {
-        if let Some(profile) = self.get_current_profile().cloned() {
-            self.connection.apply_profile(&profile);
-        }
-    }
-
-    pub fn update_profile_trusted_cert(&mut self, profile_name: &str, cert_hash: &str) {
-        for profile in &mut self.profiles {
-            if profile.name == profile_name {
-                profile.trusted_cert = Some(cert_hash.to_string());
-                break;
-            }
-        }
-        if self
-            .get_current_profile()
-            .is_some_and(|profile| profile.name == profile_name)
-        {
-            self.connection.trusted_cert = Some(cert_hash.to_string());
-        }
-    }
-
-    pub fn open_new_profile_form(&mut self) {
-        self.ui_mode = UiMode::NewProfile;
-        self.profile_form.reset_for_new();
-        self.focus = Focus::ProfileName;
-        self.push_log("[APP] Mode: New Profile (F2/N)");
-    }
-
-    pub fn open_edit_profile_form(&mut self) {
-        if let Some(profile) = self.get_current_profile().cloned() {
-            let profile_name = profile.name.clone();
-            self.ui_mode = UiMode::EditProfile;
-            self.profile_form.load_from_profile(&profile);
-            self.focus = Focus::ProfileName;
-            self.push_log(format!("[APP] Mode: Edit Profile '{}' (F3/E)", profile_name));
-        }
-    }
-
-    pub fn replace_profiles(&mut self, profiles: Vec<VpnProfile>) {
-        self.profiles = profiles;
-        self.selected_profile_index = self
-            .selected_profile_index
-            .min(self.profiles.len().saturating_sub(1));
-        if !self.profiles.is_empty() {
-            self.apply_current_profile();
-        }
-    }
-
-    pub fn cycle_connect_focus_forward(&mut self) {
-        if self.vpn_state == VpnState::WaitingCert {
+    pub fn cycle_focus_forward(&mut self) {
+        if self.active_session_state() == VpnState::WaitingCert {
             self.focus = match self.focus {
                 Focus::CertAccept => Focus::CertDeny,
                 _ => Focus::CertAccept,
             };
             return;
         }
-
-        if self.vpn_state == VpnState::WaitingToken {
+        if self.pending_action.is_some() {
+            self.focus = match self.focus {
+                Focus::ActionConfirmAccept => Focus::ActionConfirmDeny,
+                _ => Focus::ActionConfirmAccept,
+            };
+            return;
+        }
+        if self.active_session_state() == VpnState::WaitingToken {
             return;
         }
 
@@ -336,16 +415,22 @@ impl App {
         }
     }
 
-    pub fn cycle_connect_focus_backward(&mut self) {
-        if self.vpn_state == VpnState::WaitingCert {
+    pub fn cycle_focus_backward(&mut self) {
+        if self.active_session_state() == VpnState::WaitingCert {
             self.focus = match self.focus {
                 Focus::CertDeny => Focus::CertAccept,
                 _ => Focus::CertDeny,
             };
             return;
         }
-
-        if self.vpn_state == VpnState::WaitingToken {
+        if self.pending_action.is_some() {
+            self.focus = match self.focus {
+                Focus::ActionConfirmDeny => Focus::ActionConfirmAccept,
+                _ => Focus::ActionConfirmDeny,
+            };
+            return;
+        }
+        if self.active_session_state() == VpnState::WaitingToken {
             return;
         }
 
@@ -363,75 +448,84 @@ impl App {
         }
     }
 
-    pub fn cycle_profile_form_focus_forward(&mut self) {
-        self.focus = match self.focus {
-            Focus::ProfileName => Focus::Host,
-            Focus::Host => Focus::Port,
-            Focus::Port => Focus::Username,
-            Focus::Username => Focus::Password,
-            Focus::Password => Focus::SudoPassword,
-            Focus::SudoPassword => Focus::SavePassword,
-            Focus::SavePassword => Focus::UseSudoPassword,
-            Focus::UseSudoPassword => Focus::ProfileName,
-            _ => Focus::ProfileName,
-        };
+    pub fn show_help(&mut self) {
+        if self.ui_mode != UiMode::Help {
+            self.previous_ui_mode = Some(self.ui_mode.clone());
+            self.ui_mode = UiMode::Help;
+            self.focus = Focus::HelpPopup;
+        }
     }
 
-    pub fn cycle_profile_form_focus_backward(&mut self) {
-        self.focus = match self.focus {
-            Focus::ProfileName => Focus::UseSudoPassword,
-            Focus::Host => Focus::ProfileName,
-            Focus::Port => Focus::Host,
-            Focus::Username => Focus::Port,
-            Focus::Password => Focus::Username,
-            Focus::SudoPassword => Focus::Password,
-            Focus::SavePassword => Focus::SudoPassword,
-            Focus::UseSudoPassword => Focus::SavePassword,
-            _ => Focus::ProfileName,
-        };
+    pub fn hide_help(&mut self) {
+        if let Some(prev_mode) = self.previous_ui_mode.take() {
+            self.ui_mode = prev_mode;
+            self.focus = Focus::ProfileList;
+        } else {
+            self.ui_mode = UiMode::ProfileList;
+            self.focus = Focus::ProfileList;
+        }
+    }
+
+    pub fn load_profiles(&mut self, profiles: Vec<crate::config::VpnProfile>) {
+        self.profiles = profiles;
+    }
+
+    pub fn select_profile(&mut self, index: usize) {
+        if index < self.profiles.len() {
+            self.selected_profile_index = index;
+            self.focus = Focus::ProfileItem(index);
+        }
+    }
+
+    pub fn get_current_profile(&self) -> Option<&crate::config::VpnProfile> {
+        self.profiles.get(self.selected_profile_index)
+    }
+
+    pub fn apply_current_profile(&mut self) {
+        let _ = self.ensure_session_for_selected_profile();
+    }
+
+    pub fn update_profile_trusted_cert(&mut self, profile_name: &str, cert_hash: &str) {
+        for profile in self.profiles.iter_mut() {
+            if profile.name == profile_name {
+                profile.trusted_cert = Some(cert_hash.to_string());
+                break;
+            }
+        }
+        for session in self.sessions.iter_mut() {
+            if session.profile_name == profile_name {
+                session.trusted_cert = Some(cert_hash.to_string());
+            }
+        }
     }
 
     pub fn scroll_logs_up(&mut self) {
-        self.log_scroll = self.log_scroll.saturating_sub(1);
+        if let Some(session) = self.active_session_mut() {
+            session.log_scroll = session.log_scroll.saturating_sub(1);
+        }
     }
 
     pub fn scroll_logs_down(&mut self) {
-        if !self.logs.is_empty() {
-            let max = self.logs.len().saturating_sub(1);
-            if self.log_scroll < max {
-                self.log_scroll += 1;
+        if let Some(session) = self.active_session_mut()
+            && !session.logs.is_empty()
+        {
+            let max = session.logs.len().saturating_sub(1);
+            if session.log_scroll < max {
+                session.log_scroll += 1;
             }
         }
     }
 
     pub fn back_to_profile_list(&mut self) {
         if self.ui_mode == UiMode::Connect && !self.has_modal() {
-            match self.vpn_state {
-                VpnState::Disconnected | VpnState::Error(_) => {
-                    self.ui_mode = UiMode::ProfileList;
-                    self.focus = Focus::ProfileList;
-                    self.push_log("[APP] Kembali ke daftar profile");
-                }
-                _ => self.notify(
-                    "Putuskan VPN terlebih dahulu sebelum keluar",
-                    NotifLevel::Warning,
-                ),
-            }
-        } else if matches!(self.ui_mode, UiMode::NewProfile | UiMode::EditProfile) {
+            self.ui_mode = UiMode::ProfileList;
+            self.focus = Focus::ProfileList;
+            self.push_log("[APP] Kembali ke daftar profile");
+        } else if self.ui_mode == UiMode::NewProfile || self.ui_mode == UiMode::EditProfile {
             self.ui_mode = UiMode::ProfileList;
             self.focus = Focus::ProfileList;
             self.delete_confirmation = None;
             self.push_log("[APP] Kembali ke daftar profile");
         }
-    }
-}
-
-fn parse_host_port(host_port: &str) -> (String, u16) {
-    if let Some(colon) = host_port.rfind(':') {
-        let host = host_port[..colon].to_string();
-        let port = host_port[colon + 1..].parse().unwrap_or(443);
-        (host, port)
-    } else {
-        (host_port.to_string(), 443)
     }
 }

@@ -1,3 +1,5 @@
+use crate::app::{AppEvent, CertInfo, VpnState};
+use anyhow::{Result, bail};
 use std::{
     env,
     path::{Path, PathBuf},
@@ -9,8 +11,6 @@ use tokio::{
     sync::mpsc,
     time::Duration,
 };
-use anyhow::{Result, bail};
-use crate::app::{AppEvent, CertInfo, VpnState};
 
 // ─── Privilege Detection ──────────────────────────────────────────────────────
 #[derive(Debug, Clone, PartialEq)]
@@ -64,11 +64,15 @@ async fn detect_privilege_for_binary(
         .unwrap_or(false);
 
     if has_sudo {
-        let _ = tx.send(AppEvent::DebugLog("[PRIV] sudo tersedia (butuh password)".into()));
+        let _ = tx.send(AppEvent::DebugLog(
+            "[PRIV] sudo tersedia (butuh password)".into(),
+        ));
         return PrivilegeMethod::SudoWithPassword;
     }
 
-    let _ = tx.send(AppEvent::DebugLog("[PRIV] ✖ Tidak ada metode privilege.".into()));
+    let _ = tx.send(AppEvent::DebugLog(
+        "[PRIV] ✖ Tidak ada metode privilege.".into(),
+    ));
     PrivilegeMethod::Unavailable
 }
 
@@ -101,7 +105,10 @@ fn resolve_openfortivpn_path() -> Option<PathBuf> {
 
 fn detect_install_hint() -> Option<&'static str> {
     [
-        ("apt", "Install contoh: sudo apt update && sudo apt install openfortivpn"),
+        (
+            "apt",
+            "Install contoh: sudo apt update && sudo apt install openfortivpn",
+        ),
         ("dnf", "Install contoh: sudo dnf install openfortivpn"),
         ("pacman", "Install contoh: sudo pacman -S openfortivpn"),
         ("zypper", "Install contoh: sudo zypper install openfortivpn"),
@@ -127,11 +134,8 @@ fn build_command(
     trusted_cert: Option<&str>,
     method: &PrivilegeMethod,
 ) -> Command {
-    let mut vpn_args: Vec<String> = vec![
-        format!("{}:{}", host, port),
-        "-u".into(),
-        username.into(),
-    ];
+    let mut vpn_args: Vec<String> =
+        vec![format!("{}:{}", host, port), "-u".into(), username.into()];
 
     if let Some(hash) = trusted_cert {
         vpn_args.push("--trusted-cert".into());
@@ -170,7 +174,9 @@ fn build_command(
 }
 
 // ─── Connect ─────────────────────────────────────────────────────────────────
+#[allow(clippy::too_many_arguments)]
 pub async fn connect(
+    session_id: u64,
     host: &str,
     port: u16,
     username: &str,
@@ -185,11 +191,20 @@ pub async fn connect(
         bail!("Host, username, dan password tidak boleh kosong");
     }
 
-    let _ = event_tx.send(AppEvent::LogLine(format!(
-        "[VPN] Menghubungkan ke {}:{} sebagai {}{}",
-        host, port, username,
-        if trusted_cert.is_some() { " (cert trusted)" } else { "" }
-    )));
+    let _ = event_tx.send(AppEvent::LogLine {
+        session_id,
+        line: format!(
+            "[VPN] Menghubungkan ke {}:{} sebagai {}{}",
+            host,
+            port,
+            username,
+            if trusted_cert.is_some() {
+                " (cert trusted)"
+            } else {
+                ""
+            }
+        ),
+    });
 
     if let Some(hint) = detect_install_hint() {
         let _ = event_tx.send(AppEvent::DebugLog(format!(
@@ -224,7 +239,10 @@ pub async fn connect(
         );
     }
 
-    let _ = event_tx.send(AppEvent::DebugLog(format!("[PRIV] Metode: {}", method.label())));
+    let _ = event_tx.send(AppEvent::DebugLog(format!(
+        "[PRIV] Metode: {}",
+        method.label()
+    )));
 
     let mut cmd = build_command(
         &binary_path_str,
@@ -256,9 +274,11 @@ pub async fn connect(
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
-    stdin.write_all(format!("{}\n", password).as_bytes()).await?;
+    stdin
+        .write_all(format!("{}\n", password).as_bytes())
+        .await?;
     stdin.flush().await?;
-    
+
     let stdin_arc = Arc::new(Mutex::new(Some(stdin)));
 
     let stdout = child.stdout.take().expect("stdout");
@@ -276,7 +296,18 @@ pub async fn connect(
     let stdin1 = stdin_arc.clone();
 
     tokio::spawn(async move {
-        read_stream(stdout, tx1, false, cert_buf1, flag1, token_flag1, gateway_flag1, stdin1).await;
+        read_stream(
+            session_id,
+            stdout,
+            tx1,
+            false,
+            cert_buf1,
+            flag1,
+            token_flag1,
+            gateway_flag1,
+            stdin1,
+        )
+        .await;
     });
 
     let tx2 = event_tx.clone();
@@ -287,7 +318,18 @@ pub async fn connect(
     let stdin2 = stdin_arc.clone();
 
     tokio::spawn(async move {
-        read_stream(stderr, tx2, true, cert_buf2, flag2, token_flag2, gateway_flag2, stdin2).await;
+        read_stream(
+            session_id,
+            stderr,
+            tx2,
+            true,
+            cert_buf2,
+            flag2,
+            token_flag2,
+            gateway_flag2,
+            stdin2,
+        )
+        .await;
     });
 
     let tx_waiter = event_tx.clone();
@@ -296,13 +338,23 @@ pub async fn connect(
     let flag_waiter = waiting_for_input_flag.clone();
 
     tokio::spawn(async move {
-        wait_for_process(child, tx_waiter, pid_store_waiter, cert_buf_waiter, flag_waiter).await;
+        wait_for_process(
+            session_id,
+            child,
+            tx_waiter,
+            pid_store_waiter,
+            cert_buf_waiter,
+            flag_waiter,
+        )
+        .await;
     });
 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn read_stream(
+    session_id: u64,
     stream: impl tokio::io::AsyncRead + Send + Unpin + 'static,
     tx: mpsc::UnboundedSender<AppEvent>,
     _is_stderr: bool,
@@ -313,50 +365,64 @@ async fn read_stream(
     _stdin: Arc<Mutex<Option<tokio::process::ChildStdin>>>,
 ) {
     let mut lines = BufReader::new(stream).lines();
-    
+
     while let Ok(Some(line)) = lines.next_line().await {
         let line_lower = line.to_lowercase();
-        
+
         {
             let mut buf = cert_buf.lock().unwrap();
             buf.feed(&line);
         }
-        
+
         if line_lower.contains("connected to gateway") && !*gateway_connected.lock().unwrap() {
             *gateway_connected.lock().unwrap() = true;
             let _ = tx.send(AppEvent::DebugLog(format!("[VPN] {}", line.trim())));
-            
+
             if !*token_requested.lock().unwrap() {
                 *token_requested.lock().unwrap() = true;
-                let _ = tx.send(AppEvent::LogLine("[VPN] 🔐 Menunggu token OTP...".into()));
-                let _ = tx.send(AppEvent::NeedToken);
-                let _ = tx.send(AppEvent::StateChanged(VpnState::WaitingToken));
+                let _ = tx.send(AppEvent::LogLine {
+                    session_id,
+                    line: "[VPN] 🔐 Menunggu token OTP...".into(),
+                });
+                let _ = tx.send(AppEvent::NeedToken(session_id));
+                let _ = tx.send(AppEvent::StateChanged {
+                    session_id,
+                    state: VpnState::WaitingToken,
+                });
                 *waiting_flag.lock().unwrap() = true;
             }
             continue;
         }
-        
+
         if line_lower.contains("tunnel is up") {
             let _ = tx.send(AppEvent::DebugLog(format!("[VPN] ✅ {}", line.trim())));
-            let _ = tx.send(AppEvent::StateChanged(VpnState::Connected));
+            let _ = tx.send(AppEvent::StateChanged {
+                session_id,
+                state: VpnState::Connected,
+            });
             *waiting_flag.lock().unwrap() = false;
             continue;
         }
-        
+
         if line_lower.contains("password:") && line_lower.contains("vpn account") {
             continue;
         }
-        
+
         if !line.trim().is_empty() && !line_lower.contains("two-factor") {
-            let prefix = if line_lower.contains("error") { "[ERR] " }
-                else if line_lower.contains("warn") { "[WARN] " }
-                else { "[VPN] " };
+            let prefix = if line_lower.contains("error") {
+                "[ERR] "
+            } else if line_lower.contains("warn") {
+                "[WARN] "
+            } else {
+                "[VPN] "
+            };
             let _ = tx.send(AppEvent::DebugLog(format!("{}{}", prefix, line.trim())));
         }
     }
 }
 
 async fn wait_for_process(
+    session_id: u64,
     mut child: Child,
     tx: mpsc::UnboundedSender<AppEvent>,
     pid_store: Arc<Mutex<Option<u32>>>,
@@ -368,8 +434,14 @@ async fn wait_for_process(
 
     let cert_info = cert_buf.lock().unwrap().try_emit();
     if let Some(info) = cert_info {
-        let _ = tx.send(AppEvent::DebugLog(format!("[CERT] Untrusted: CN={}", info.subject_cn)));
-        let _ = tx.send(AppEvent::CertError(info));
+        let _ = tx.send(AppEvent::DebugLog(format!(
+            "[CERT] Untrusted: CN={}",
+            info.subject_cn
+        )));
+        let _ = tx.send(AppEvent::CertError {
+            session_id,
+            cert: info,
+        });
         return;
     }
 
@@ -378,74 +450,106 @@ async fn wait_for_process(
     match status {
         Ok(exit) => {
             if was_waiting {
-                let _ = tx.send(AppEvent::DebugLog("[VPN] ⚠️ Koneksi terputus saat menunggu token".into()));
+                let _ = tx.send(AppEvent::DebugLog(
+                    "[VPN] ⚠️ Koneksi terputus saat menunggu token".into(),
+                ));
                 *waiting_flag.lock().unwrap() = false;
-                let _ = tx.send(AppEvent::StateChanged(VpnState::Disconnected));
+                let _ = tx.send(AppEvent::StateChanged {
+                    session_id,
+                    state: VpnState::Disconnected,
+                });
             } else if exit.success() {
                 let _ = tx.send(AppEvent::DebugLog("[VPN] Koneksi ditutup".into()));
-                let _ = tx.send(AppEvent::StateChanged(VpnState::Disconnected));
+                let _ = tx.send(AppEvent::StateChanged {
+                    session_id,
+                    state: VpnState::Disconnected,
+                });
             } else {
                 let code = exit.code().unwrap_or(-1);
                 let _ = tx.send(AppEvent::DebugLog(format!("[VPN] Exit code: {}", code)));
-                let _ = tx.send(AppEvent::StateChanged(VpnState::Disconnected));
+                let _ = tx.send(AppEvent::StateChanged {
+                    session_id,
+                    state: VpnState::Disconnected,
+                });
             }
         }
         Err(e) => {
             let _ = tx.send(AppEvent::DebugLog(format!("[VPN] Error: {}", e)));
-            let _ = tx.send(AppEvent::StateChanged(VpnState::Disconnected));
+            let _ = tx.send(AppEvent::StateChanged {
+                session_id,
+                state: VpnState::Disconnected,
+            });
         }
     }
 }
 
 // ─── Send OTP Token ──────────────────────────────────────────────────────────
 pub async fn send_token(
+    session_id: u64,
     token: &str,
     pid_store: Arc<Mutex<Option<u32>>>,
     event_tx: mpsc::UnboundedSender<AppEvent>,
 ) -> Result<()> {
-    let pid = pid_store.lock().unwrap().clone();
+    let pid = *pid_store.lock().unwrap();
     if let Some(pid) = pid {
-        let _ = event_tx.send(AppEvent::LogLine(format!("[TOKEN] Mengirim token ke PID {}...", pid)));
-        
+        let _ = event_tx.send(AppEvent::LogLine {
+            session_id,
+            line: format!("[TOKEN] Mengirim token ke PID {}...", pid),
+        });
+
         let token_line = format!("{}\n", token);
-        
+
         let methods = vec![
-            format!("echo '{}' | sudo tee /proc/{}/fd/0 > /dev/null 2>&1", token, pid),
-            format!("printf '{}' | sudo tee /proc/{}/fd/0 > /dev/null 2>&1", token, pid),
-            format!("sudo sh -c \"echo '{}' > /proc/{}/fd/0\" 2>/dev/null", token, pid),
+            format!(
+                "echo '{}' | sudo tee /proc/{}/fd/0 > /dev/null 2>&1",
+                token, pid
+            ),
+            format!(
+                "printf '{}' | sudo tee /proc/{}/fd/0 > /dev/null 2>&1",
+                token, pid
+            ),
+            format!(
+                "sudo sh -c \"echo '{}' > /proc/{}/fd/0\" 2>/dev/null",
+                token, pid
+            ),
         ];
-        
+
         for method in methods {
-            let output = Command::new("sh")
-                .arg("-c")
-                .arg(&method)
-                .output()
-                .await;
-                
-            if let Ok(o) = output {
-                if o.status.success() {
-                    let _ = event_tx.send(AppEvent::LogLine("[TOKEN] ✅ Token berhasil dikirim".into()));
-                    return Ok(());
-                }
+            let output = Command::new("sh").arg("-c").arg(&method).output().await;
+
+            if let Ok(o) = output
+                && o.status.success()
+            {
+                let _ = event_tx.send(AppEvent::LogLine {
+                    session_id,
+                    line: "[TOKEN] ✅ Token berhasil dikirim".into(),
+                });
+                return Ok(());
             }
         }
-        
+
         let temp_file = "/tmp/fortivpn_token.txt";
         let _ = tokio::fs::write(temp_file, token_line.as_bytes()).await;
         let output = Command::new("sh")
             .arg("-c")
-            .arg(format!("sudo cat {} > /proc/{}/fd/0 2>/dev/null", temp_file, pid))
+            .arg(format!(
+                "sudo cat {} > /proc/{}/fd/0 2>/dev/null",
+                temp_file, pid
+            ))
             .output()
             .await;
         let _ = tokio::fs::remove_file(temp_file).await;
-        
-        if let Ok(o) = output {
-            if o.status.success() {
-                let _ = event_tx.send(AppEvent::LogLine("[TOKEN] ✅ Token dikirim via file".into()));
-                return Ok(());
-            }
+
+        if let Ok(o) = output
+            && o.status.success()
+        {
+            let _ = event_tx.send(AppEvent::LogLine {
+                session_id,
+                line: "[TOKEN] ✅ Token dikirim via file".into(),
+            });
+            return Ok(());
         }
-        
+
         Err(anyhow::anyhow!("Gagal mengirim token"))
     } else {
         Err(anyhow::anyhow!("Tidak ada proses VPN aktif"))
@@ -477,7 +581,6 @@ impl CertBuffer {
             subject_cn: self.subject_cn.clone(),
             subject_org: self.subject_org.clone(),
             issuer_cn: self.issuer_cn.clone(),
-            raw_lines: self.raw_lines.clone(),
         })
     }
 
@@ -499,10 +602,10 @@ impl CertBuffer {
 
         if lower.contains("--trusted-cert") {
             let parts: Vec<&str> = trimmed.split_whitespace().collect();
-            if let Some(hash) = parts.last() {
-                if hash.len() >= 32 {
-                    self.hash = hash.to_string();
-                }
+            if let Some(hash) = parts.last()
+                && hash.len() >= 32
+            {
+                self.hash = hash.to_string();
             }
             return;
         }
@@ -529,10 +632,8 @@ impl CertBuffer {
                         "O" => self.subject_org = val.to_string(),
                         _ => {}
                     }
-                } else if self.in_issuer {
-                    if key == "CN" {
-                        self.issuer_cn = val.to_string();
-                    }
+                } else if self.in_issuer && key == "CN" {
+                    self.issuer_cn = val.to_string();
                 }
             }
         }
@@ -546,21 +647,44 @@ impl CertBuffer {
 
 // ─── Disconnect ──────────────────────────────────────────────────────────────
 pub async fn disconnect(
+    session_id: u64,
     pid_store: Arc<Mutex<Option<u32>>>,
     event_tx: mpsc::UnboundedSender<AppEvent>,
 ) -> Result<()> {
-    let pid = pid_store.lock().unwrap().clone();
+    let pid = *pid_store.lock().unwrap();
     if let Some(pid) = pid {
-        let _ = event_tx.send(AppEvent::LogLine(format!("[VPN] Menghentikan PID {}...", pid)));
-        let _ = Command::new("kill").arg("-TERM").arg(pid.to_string()).output().await;
+        let _ = event_tx.send(AppEvent::LogLine {
+            session_id,
+            line: format!("[VPN] Menghentikan PID {}...", pid),
+        });
+        let _ = Command::new("kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .output()
+            .await;
         tokio::time::sleep(Duration::from_secs(1)).await;
-        let alive = Command::new("kill").arg("-0").arg(pid.to_string()).output().await
-            .map(|o| o.status.success()).unwrap_or(false);
+        let alive = Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .output()
+            .await
+            .map(|o| o.status.success())
+            .unwrap_or(false);
         if alive {
-            let _ = Command::new("kill").arg("-KILL").arg(pid.to_string()).output().await;
-            let _ = event_tx.send(AppEvent::LogLine("[VPN] Force kill dengan SIGKILL".into()));
+            let _ = Command::new("kill")
+                .arg("-KILL")
+                .arg(pid.to_string())
+                .output()
+                .await;
+            let _ = event_tx.send(AppEvent::LogLine {
+                session_id,
+                line: "[VPN] Force kill dengan SIGKILL".into(),
+            });
         } else {
-            let _ = event_tx.send(AppEvent::LogLine("[VPN] Proses berhenti".into()));
+            let _ = event_tx.send(AppEvent::LogLine {
+                session_id,
+                line: "[VPN] Proses berhenti".into(),
+            });
         }
         *pid_store.lock().unwrap() = None;
     }

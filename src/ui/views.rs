@@ -1,26 +1,200 @@
+use crate::app::{App, Focus, NotifLevel, PendingAction, UiMode, VpnState};
 use ratatui::{
+    Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, List, ListItem, Paragraph},
-    Frame,
+    widgets::{Block, BorderType, Borders, Clear, List, ListItem, Padding, Paragraph},
 };
 
-use crate::app::{App, Focus, UiMode, VpnState};
+// ─── Palette ─────────────────────────────────────────────────────────────────
+const C_BG: Color = Color::Rgb(18, 18, 28);
+const C_SURFACE: Color = Color::Rgb(28, 28, 42);
+const C_BORDER: Color = Color::Rgb(60, 60, 90);
+const C_FOCUS: Color = Color::Rgb(100, 180, 255);
+const C_TEXT: Color = Color::Rgb(220, 220, 240);
+const C_DIM: Color = Color::Rgb(100, 100, 130);
+const C_GREEN: Color = Color::Rgb(80, 220, 120);
+const C_RED: Color = Color::Rgb(255, 80, 80);
+const C_YELLOW: Color = Color::Rgb(255, 210, 60);
+const C_ORANGE: Color = Color::Rgb(255, 140, 40);
+const C_CYAN: Color = Color::Rgb(60, 210, 210);
+const C_LOG_INFO: Color = Color::Rgb(140, 200, 255);
+const C_LOG_ERR: Color = Color::Rgb(255, 100, 100);
+const C_LOG_WARN: Color = Color::Rgb(255, 200, 80);
 
-use super::{
-    theme::{
-        C_BG, C_BORDER, C_CYAN, C_DIM, C_FOCUS, C_GREEN, C_LOG_ERR, C_LOG_INFO, C_LOG_WARN,
-        C_ORANGE, C_RED, C_SURFACE, C_TEXT, C_YELLOW,
-    },
-    widgets::render_input,
-};
+// ─── Main render entry ────────────────────────────────────────────────────────
+pub fn render(f: &mut Frame, app: &App) {
+    let full = f.area();
+    f.render_widget(Block::default().style(Style::default().bg(C_BG)), full);
 
-pub fn render_title(f: &mut Frame, app: &App, area: Rect) {
-    let (state_color, state_icon) = match &app.vpn_state {
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(10),
+            Constraint::Length(3),
+        ])
+        .split(full);
+
+    render_title(f, app, outer[0]);
+    render_body(f, app, outer[1]);
+    render_statusbar(f, app, outer[2]);
+
+    // Modal popups (di atas semua layer)
+    if app.ui_mode == UiMode::Help {
+        render_help_popup(f, app, full);
+    }
+    if app.pending_action.is_some() {
+        render_action_confirm_popup(f, app, full);
+        return;
+    }
+
+    match app.active_session_state() {
+        VpnState::WaitingToken => {
+            render_token_popup(f, app, full);
+        }
+        VpnState::WaitingCert => {
+            if let Some(cert) = app.active_session().and_then(|s| s.pending_cert.as_ref()) {
+                render_cert_popup(f, app, cert, full);
+            }
+        }
+        _ => {
+            if let Some((msg, level)) = &app.notification {
+                render_notification(f, msg, level, full);
+            }
+        }
+    }
+}
+
+fn render_action_confirm_popup(f: &mut Frame, app: &App, area: Rect) {
+    let Some(action) = app.pending_action.as_ref() else {
+        return;
+    };
+    let popup_w = 60u16;
+    let popup_h = 9u16;
+    let popup_x = area.x + area.width.saturating_sub(popup_w) / 2;
+    let popup_y = area.y + area.height.saturating_sub(popup_h) / 2;
+    let popup_area = Rect {
+        x: popup_x,
+        y: popup_y,
+        width: popup_w,
+        height: popup_h,
+    };
+    f.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .title(Span::styled(
+            format!(" ⚠  {} ", action.title()),
+            Style::default().fg(C_YELLOW).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
+        .border_style(Style::default().fg(C_YELLOW))
+        .style(Style::default().bg(Color::Rgb(24, 20, 12)));
+    f.render_widget(block, popup_area);
+
+    let inner = Rect {
+        x: popup_area.x + 2,
+        y: popup_area.y + 1,
+        width: popup_area.width.saturating_sub(4),
+        height: popup_area.height.saturating_sub(2),
+    };
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+
+    let target = match action {
+        PendingAction::DisconnectActive | PendingAction::CloseActive => app
+            .active_session()
+            .map(|s| format!("Session '{}'", s.profile_name))
+            .unwrap_or_else(|| "Session aktif".into()),
+        PendingAction::DisconnectAll => format!("Semua session aktif ({})", app.sessions.len()),
+        PendingAction::CloseAllIdle => "Semua tab session idle".into(),
+    };
+
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                "Aksi berikut akan dijalankan:",
+                Style::default().fg(C_TEXT),
+            )),
+            Line::from(Span::styled(
+                target,
+                Style::default().fg(C_CYAN).add_modifier(Modifier::BOLD),
+            )),
+        ]),
+        rows[0],
+    );
+
+    let btn_rows = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(rows[1]);
+
+    let yes_focused = app.focus == Focus::ActionConfirmAccept;
+    let no_focused = app.focus == Focus::ActionConfirmDeny;
+
+    let yes_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(if yes_focused {
+            BorderType::Thick
+        } else {
+            BorderType::Rounded
+        })
+        .border_style(Style::default().fg(C_GREEN));
+    let no_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(if no_focused {
+            BorderType::Thick
+        } else {
+            BorderType::Rounded
+        })
+        .border_style(Style::default().fg(C_RED));
+
+    f.render_widget(
+        Paragraph::new(" ✔ YA [Y/Enter] ")
+            .block(yes_block)
+            .style(if yes_focused {
+                Style::default()
+                    .fg(C_BG)
+                    .bg(C_GREEN)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(C_GREEN).add_modifier(Modifier::BOLD)
+            })
+            .alignment(Alignment::Center),
+        btn_rows[0],
+    );
+    f.render_widget(
+        Paragraph::new(" ✖ BATAL [N/Esc] ")
+            .block(no_block)
+            .style(if no_focused {
+                Style::default()
+                    .fg(C_BG)
+                    .bg(C_RED)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(C_RED).add_modifier(Modifier::BOLD)
+            })
+            .alignment(Alignment::Center),
+        btn_rows[1],
+    );
+}
+
+// ─── Title Bar ───────────────────────────────────────────────────────────────
+fn render_title(f: &mut Frame, app: &App, area: Rect) {
+    let session_state = app.active_session_state();
+    let (state_color, state_icon) = match &session_state {
         VpnState::Disconnected => (C_DIM, "● "),
         VpnState::Connecting => (C_YELLOW, "◌ "),
-        VpnState::WaitingToken | VpnState::WaitingCert => (C_ORANGE, "◎ "),
+        VpnState::WaitingToken => (C_ORANGE, "◎ "),
+        VpnState::WaitingCert => (C_ORANGE, "◎ "),
         VpnState::Connected => (C_GREEN, "● "),
         VpnState::Disconnecting => (C_YELLOW, "◌ "),
         VpnState::Error(_) => (C_RED, "✖ "),
@@ -35,29 +209,557 @@ pub fn render_title(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let title_line = Line::from(vec![
-        Span::styled("  FortiVPN  ", Style::default().fg(C_FOCUS).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "  OPENFortiVPN  ",
+            Style::default().fg(C_FOCUS).add_modifier(Modifier::BOLD),
+        ),
         Span::styled("TUI   ", Style::default().fg(C_DIM)),
         Span::styled("│   ", Style::default().fg(C_BORDER)),
-        Span::styled(format!("{}   ", mode_indicator), Style::default().fg(C_CYAN).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("{}   ", mode_indicator),
+            Style::default().fg(C_CYAN).add_modifier(Modifier::BOLD),
+        ),
         Span::styled("│   ", Style::default().fg(C_BORDER)),
-        Span::styled(format!("{}  ", state_icon), Style::default().fg(state_color)),
-        Span::styled(app.vpn_state.label(), Style::default().fg(state_color).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("{}   ", app.active_session_label()),
+            Style::default().fg(C_YELLOW),
+        ),
+        Span::styled("│   ", Style::default().fg(C_BORDER)),
+        Span::styled(
+            format!("{}  ", state_icon),
+            Style::default().fg(state_color),
+        ),
+        Span::styled(
+            session_state.label(),
+            Style::default()
+                .fg(state_color)
+                .add_modifier(Modifier::BOLD),
+        ),
     ]);
 
-    let block = panel_block("").style(Style::default().bg(C_SURFACE));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(C_BORDER))
+        .style(Style::default().bg(C_SURFACE));
+
     f.render_widget(Paragraph::new(title_line).block(block), area);
 }
 
-pub fn render_profile_list_screen(f: &mut Frame, app: &App, area: Rect) {
-    let panels = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-        .split(area);
-    render_profile_list(f, app, panels[0]);
-    render_profile_details(f, app, panels[1]);
+// ─── Main Body ───────────────────────────────────────────────────────────────
+fn render_body(f: &mut Frame, app: &App, area: Rect) {
+    match app.ui_mode {
+        UiMode::ProfileList => {
+            let panels = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+                .split(area);
+            render_profile_list(f, app, panels[0]);
+            render_profile_details(f, app, panels[1]);
+        }
+        UiMode::NewProfile | UiMode::EditProfile => {
+            render_profile_form(f, app, area);
+        }
+        UiMode::Connect => {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(3), Constraint::Min(10)])
+                .split(area);
+            render_session_tabs(f, app, rows[0]);
+            let panels = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(42), Constraint::Min(10)])
+                .split(rows[1]);
+            render_controls(f, app, panels[0]);
+            render_logs(f, app, panels[1]);
+        }
+        UiMode::Help => {
+            // Konten tetap dirender sesuai mode sebelumnya
+            if let Some(ref mode) = app.previous_ui_mode {
+                match mode {
+                    UiMode::ProfileList => {
+                        let panels = Layout::default()
+                            .direction(Direction::Horizontal)
+                            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+                            .split(area);
+                        render_profile_list(f, app, panels[0]);
+                        render_profile_details(f, app, panels[1]);
+                    }
+                    UiMode::Connect => {
+                        let rows = Layout::default()
+                            .direction(Direction::Vertical)
+                            .constraints([Constraint::Length(3), Constraint::Min(10)])
+                            .split(area);
+                        render_session_tabs(f, app, rows[0]);
+                        let panels = Layout::default()
+                            .direction(Direction::Horizontal)
+                            .constraints([Constraint::Length(42), Constraint::Min(10)])
+                            .split(rows[1]);
+                        render_controls(f, app, panels[0]);
+                        render_logs(f, app, panels[1]);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
 }
 
-pub fn render_profile_form_screen(f: &mut Frame, app: &App, area: Rect) {
+fn render_session_tabs(f: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default()
+        .title(" Sessions ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(C_BORDER))
+        .style(Style::default().bg(C_SURFACE));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if app.sessions.is_empty() {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                "Belum ada session aktif",
+                Style::default().fg(C_DIM),
+            ))
+            .alignment(Alignment::Center),
+            inner,
+        );
+        return;
+    }
+
+    let mut spans = Vec::new();
+    for (idx, session) in app.sessions.iter().enumerate() {
+        let is_active = app.active_session_index == Some(idx);
+        let style = if is_active {
+            Style::default()
+                .fg(C_BG)
+                .bg(C_FOCUS)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(C_TEXT).bg(C_BG)
+        };
+        let state = match session.vpn_state {
+            VpnState::Connected => "●",
+            VpnState::Connecting | VpnState::Disconnecting => "◌",
+            VpnState::WaitingToken | VpnState::WaitingCert => "◎",
+            VpnState::Error(_) => "✖",
+            VpnState::Disconnected => "○",
+        };
+        spans.push(Span::styled(
+            format!(" {} {} {} ", idx + 1, state, session.profile_name),
+            style,
+        ));
+        spans.push(Span::styled(" ", Style::default()));
+    }
+
+    f.render_widget(Paragraph::new(Line::from(spans)), inner);
+}
+
+// ─── Help Popup ──────────────────────────────────────────────────────────────
+fn render_help_popup(f: &mut Frame, _app: &App, area: Rect) {
+    let popup_w = 72u16;
+    let popup_h = 28u16;
+    let popup_x = area.x + (area.width.saturating_sub(popup_w)) / 2;
+    let popup_y = area.y + (area.height.saturating_sub(popup_h)) / 2;
+    let popup_area = Rect {
+        x: popup_x,
+        y: popup_y,
+        width: popup_w,
+        height: popup_h,
+    };
+
+    f.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .title(Span::styled(
+            " 🛈  HELP - Keyboard Shortcuts  🛈 ",
+            Style::default().fg(C_CYAN).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
+        .border_style(Style::default().fg(C_CYAN))
+        .style(Style::default().bg(Color::Rgb(20, 20, 30)));
+
+    f.render_widget(block, popup_area);
+
+    let inner = Rect {
+        x: popup_area.x + 2,
+        y: popup_area.y + 1,
+        width: popup_area.width.saturating_sub(4),
+        height: popup_area.height.saturating_sub(2),
+    };
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(7),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(6),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(7),
+            Constraint::Length(1),
+            Constraint::Length(2),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+
+    let title_style = Style::default().fg(C_YELLOW).add_modifier(Modifier::BOLD);
+    let key_style = Style::default().fg(C_CYAN).add_modifier(Modifier::BOLD);
+    let desc_style = Style::default().fg(C_TEXT);
+
+    // Global Shortcuts
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            "═══════════════════════ GLOBAL SHORTCUTS ═══════════════════════",
+            title_style,
+        )),
+        rows[1],
+    );
+
+    let global_shortcuts = [
+        ("F1", "Buka help ini"),
+        ("ESC / Ctrl+B", "Kembali ke daftar profile / Tutup help"),
+        ("Ctrl+Q / Ctrl+C", "Keluar aplikasi"),
+    ];
+
+    let global_text: Vec<Line> = global_shortcuts
+        .iter()
+        .map(|(key, desc)| {
+            Line::from(vec![
+                Span::styled(format!("  {:<14}", key), key_style),
+                Span::styled(format!("  {}", desc), desc_style),
+            ])
+        })
+        .collect();
+
+    f.render_widget(Paragraph::new(global_text), rows[2]);
+
+    // Profile List Shortcuts
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            "═══════════════════════ PROFILE LIST MODE ═══════════════════════",
+            title_style,
+        )),
+        rows[4],
+    );
+
+    let profile_shortcuts = [
+        ("↑ / ↓", "Pilih profile"),
+        ("Enter / F5", "Connect ke profile terpilih"),
+        ("F2 / N", "Buat profile baru"),
+        ("F3 / E", "Edit profile terpilih"),
+        ("F4 / D", "Hapus profile terpilih (konfirmasi dua kali)"),
+    ];
+
+    let profile_text: Vec<Line> = profile_shortcuts
+        .iter()
+        .map(|(key, desc)| {
+            Line::from(vec![
+                Span::styled(format!("  {:<14}", key), key_style),
+                Span::styled(format!("  {}", desc), desc_style),
+            ])
+        })
+        .collect();
+
+    f.render_widget(Paragraph::new(profile_text), rows[5]);
+
+    // Connect Mode Shortcuts
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            "═══════════════════════ CONNECT MODE ═══════════════════════",
+            title_style,
+        )),
+        rows[7],
+    );
+
+    let connect_shortcuts = vec![
+        ("← / →", "Pindah session aktif"),
+        ("Tab", "Pindah fokus ke field berikutnya"),
+        ("Shift+Tab", "Pindah fokus ke field sebelumnya"),
+        ("Enter", "Connect / Disconnect"),
+        ("Ctrl+K", "Disconnect session aktif"),
+        ("Ctrl+Shift+K", "Disconnect semua session"),
+        ("Ctrl+W", "Tutup tab session aktif"),
+        ("Ctrl+Shift+W", "Tutup semua tab yang sudah idle"),
+        ("Ctrl+P", "Tampilkan/sembunyikan password"),
+        ("Ctrl+S", "Simpan konfigurasi ke profile"),
+        ("↑ / ↓ / PgUp / PgDn", "Scroll log"),
+    ];
+
+    let connect_text: Vec<Line> = connect_shortcuts
+        .iter()
+        .map(|(key, desc)| {
+            Line::from(vec![
+                Span::styled(format!("  {:<14}", key), key_style),
+                Span::styled(format!("  {}", desc), desc_style),
+            ])
+        })
+        .collect();
+
+    f.render_widget(Paragraph::new(connect_text), rows[8]);
+
+    // Hint
+    let hint_style = Style::default().fg(C_DIM);
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                "  Debug log: jalankan `openfortivpn-tui -d` untuk simpan log ke /tmp/openfortivpn-tui.log",
+                hint_style,
+            )),
+            Line::from(Span::styled(
+                "  Tekan ESC atau F1 untuk menutup help ini",
+                hint_style,
+            )),
+        ])
+            .alignment(Alignment::Center),
+        rows[10],
+    );
+}
+
+// ─── Profile List ────────────────────────────────────────────────────────────
+fn render_profile_list(f: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default()
+        .title(" 📋 VPN Connections ")
+        .title_style(Style::default().fg(C_FOCUS).add_modifier(Modifier::BOLD))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(C_BORDER))
+        .style(Style::default().bg(C_SURFACE));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if app.profiles.is_empty() {
+        let empty_msg = Paragraph::new(Span::styled(
+            "Belum ada koneksi.\n\nTekan [F2] atau [N] untuk membuat baru",
+            Style::default().fg(C_DIM),
+        ))
+        .alignment(Alignment::Center);
+        f.render_widget(empty_msg, inner);
+        return;
+    }
+
+    let items: Vec<ListItem> = app
+        .profiles
+        .iter()
+        .enumerate()
+        .map(|(i, profile)| {
+            let is_selected = i == app.selected_profile_index;
+            let is_focused = matches!(app.focus, Focus::ProfileItem(idx) if idx == i);
+            let has_session = app.find_session_by_profile_name(&profile.name);
+
+            let style = if is_focused {
+                Style::default()
+                    .fg(C_BG)
+                    .bg(C_FOCUS)
+                    .add_modifier(Modifier::BOLD)
+            } else if is_selected {
+                Style::default().fg(C_GREEN).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(C_TEXT)
+            };
+
+            let indicator = if is_selected { "▶ " } else { "  " };
+            let cert_indicator = if profile.trusted_cert.is_some() {
+                "✓"
+            } else {
+                "?"
+            };
+
+            let mut spans = vec![
+                Span::styled(format!("{}{}", indicator, profile.name), style),
+                Span::styled(
+                    format!(" @ {}:{}", profile.host, profile.port),
+                    Style::default().fg(C_DIM),
+                ),
+                Span::styled(
+                    format!(" [{}]", cert_indicator),
+                    if profile.trusted_cert.is_some() {
+                        Style::default().fg(C_GREEN)
+                    } else {
+                        Style::default().fg(C_YELLOW)
+                    },
+                ),
+            ];
+
+            if let Some(session_idx) = has_session {
+                spans.push(Span::styled(
+                    format!(" [S{}]", session_idx + 1),
+                    Style::default().fg(C_CYAN).add_modifier(Modifier::BOLD),
+                ));
+            }
+
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+
+    let list = List::new(items);
+    f.render_widget(list, inner);
+}
+
+// ─── Profile Details ─────────────────────────────────────────────────────────
+fn render_profile_details(f: &mut Frame, app: &App, area: Rect) {
+    if app.profiles.is_empty() {
+        return;
+    }
+
+    if let Some(profile) = app.profiles.get(app.selected_profile_index) {
+        let block = Block::default()
+            .title(" 📄 Connection Details ")
+            .title_style(Style::default().fg(C_FOCUS).add_modifier(Modifier::BOLD))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(C_BORDER))
+            .style(Style::default().bg(C_SURFACE));
+
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .margin(1)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(3),
+                Constraint::Min(0),
+            ])
+            .split(inner);
+
+        let label_style = Style::default().fg(C_DIM);
+        let value_style = Style::default().fg(C_TEXT);
+
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("Nama:     ", label_style),
+                Span::styled(&profile.name, value_style.add_modifier(Modifier::BOLD)),
+            ])),
+            rows[0],
+        );
+
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("Host:     ", label_style),
+                Span::styled(format!("{}:{}", profile.host, profile.port), value_style),
+            ])),
+            rows[1],
+        );
+
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("Username: ", label_style),
+                Span::styled(&profile.username, value_style),
+            ])),
+            rows[2],
+        );
+
+        let cert_status = if profile.trusted_cert.is_some() {
+            "✓ Trusted"
+        } else {
+            "⚠ Not trusted"
+        };
+        let cert_color = if profile.trusted_cert.is_some() {
+            C_GREEN
+        } else {
+            C_YELLOW
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("Cert:     ", label_style),
+                Span::styled(cert_status, Style::default().fg(cert_color)),
+            ])),
+            rows[3],
+        );
+
+        let password_status = if profile.save_password {
+            "✓ Saved"
+        } else {
+            "✗ Not saved"
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("Password: ", label_style),
+                Span::styled(
+                    password_status,
+                    Style::default().fg(if profile.save_password {
+                        C_GREEN
+                    } else {
+                        C_DIM
+                    }),
+                ),
+            ])),
+            rows[4],
+        );
+
+        let sudo_status = if profile.use_sudo_password {
+            "✓ Enabled"
+        } else {
+            "✗ Disabled"
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("Sudo:     ", label_style),
+                Span::styled(
+                    sudo_status,
+                    Style::default().fg(if profile.use_sudo_password {
+                        C_GREEN
+                    } else {
+                        C_DIM
+                    }),
+                ),
+            ])),
+            rows[5],
+        );
+
+        let btn_area = rows[6];
+        let btn_rows = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(33),
+                Constraint::Percentage(34),
+                Constraint::Percentage(33),
+            ])
+            .split(btn_area);
+
+        let connect_btn = Paragraph::new(" 🔌 Connect ")
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded),
+            )
+            .alignment(Alignment::Center);
+        f.render_widget(connect_btn, btn_rows[0]);
+
+        let edit_btn = Paragraph::new(" ✏️ Edit ")
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded),
+            )
+            .alignment(Alignment::Center);
+        f.render_widget(edit_btn, btn_rows[1]);
+
+        let delete_btn = Paragraph::new(" 🗑️ Delete ")
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded),
+            )
+            .alignment(Alignment::Center);
+        f.render_widget(delete_btn, btn_rows[2]);
+    }
+}
+
+// ─── Profile Form ────────────────────────────────────────────────────────────
+fn render_profile_form(f: &mut Frame, app: &App, area: Rect) {
     let title = match app.ui_mode {
         UiMode::NewProfile => " ✨ New VPN Connection ",
         UiMode::EditProfile => " ✏️ Edit VPN Connection ",
@@ -65,11 +767,15 @@ pub fn render_profile_form_screen(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let block = Block::default()
-        .title(Span::styled(title, Style::default().fg(C_FOCUS).add_modifier(Modifier::BOLD)))
+        .title(Span::styled(
+            title,
+            Style::default().fg(C_FOCUS).add_modifier(Modifier::BOLD),
+        ))
         .borders(Borders::ALL)
         .border_type(BorderType::Thick)
         .border_style(Style::default().fg(C_FOCUS))
         .style(Style::default().bg(C_SURFACE));
+
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -90,161 +796,135 @@ pub fn render_profile_form_screen(f: &mut Frame, app: &App, area: Rect) {
         ])
         .split(inner);
 
-    let form = &app.profile_form;
-    render_input(f, rows[0], " Profile Name ", &form.name, matches!(app.focus, Focus::ProfileName), false, "My VPN");
-    render_input(f, rows[1], " Host ", &form.host, matches!(app.focus, Focus::Host), false, "vpn.example.com");
-    render_input(f, rows[2], " Port ", &form.port, matches!(app.focus, Focus::Port), false, "443");
-    render_input(f, rows[3], " Username ", &form.username, matches!(app.focus, Focus::Username), false, "user@domain");
-    render_input(f, rows[4], " Password ", &form.password, matches!(app.focus, Focus::Password), !app.show_password, "••••••••");
-    render_input(f, rows[5], " Sudo Password ", &form.sudo_password, matches!(app.focus, Focus::SudoPassword), true, "kosongkan jika NOPASSWD");
+    render_input(
+        f,
+        rows[0],
+        " Profile Name ",
+        &app.profile_name,
+        matches!(app.focus, Focus::ProfileName),
+        false,
+        "My VPN",
+    );
+    render_input(
+        f,
+        rows[1],
+        " Host ",
+        &app.profile_host,
+        matches!(app.focus, Focus::Host),
+        false,
+        "vpn.example.com",
+    );
+    render_input(
+        f,
+        rows[2],
+        " Port ",
+        &app.profile_port,
+        matches!(app.focus, Focus::Port),
+        false,
+        "443",
+    );
+    render_input(
+        f,
+        rows[3],
+        " Username ",
+        &app.profile_username,
+        matches!(app.focus, Focus::Username),
+        false,
+        "user@domain",
+    );
+    render_input(
+        f,
+        rows[4],
+        " Password ",
+        &app.profile_password,
+        matches!(app.focus, Focus::Password),
+        !app.show_password,
+        "••••••••",
+    );
+    render_input(
+        f,
+        rows[5],
+        " Sudo Password ",
+        &app.profile_sudo_password,
+        matches!(app.focus, Focus::SudoPassword),
+        true,
+        "kosongkan jika NOPASSWD",
+    );
 
-    render_checkbox(f, rows[6], "Simpan password", form.save_password, matches!(app.focus, Focus::SavePassword));
-    render_checkbox(f, rows[7], "Gunakan sudo password", form.use_sudo_password, matches!(app.focus, Focus::UseSudoPassword));
+    let save_pwd_style = if matches!(app.focus, Focus::SavePassword) {
+        Style::default().fg(C_FOCUS).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(C_DIM)
+    };
+    let save_pwd_check = if app.profile_save_password {
+        "[✓]"
+    } else {
+        "[ ]"
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            format!(" {} Simpan password", save_pwd_check),
+            save_pwd_style,
+        )])),
+        rows[6],
+    );
 
+    let use_sudo_style = if matches!(app.focus, Focus::UseSudoPassword) {
+        Style::default().fg(C_FOCUS).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(C_DIM)
+    };
+    let use_sudo_check = if app.profile_use_sudo_password {
+        "[✓]"
+    } else {
+        "[ ]"
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            format!(" {} Gunakan sudo password", use_sudo_check),
+            use_sudo_style,
+        )])),
+        rows[7],
+    );
+
+    let btn_area = rows[8];
     let btn_rows = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(rows[8]);
-    render_action_button(f, btn_rows[0], " 💾 Save ");
-    render_action_button(f, btn_rows[1], " ❌ Cancel ");
+        .split(btn_area);
+
+    let save_btn = Paragraph::new(" 💾 Save ")
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded),
+        )
+        .alignment(Alignment::Center);
+    let cancel_btn = Paragraph::new(" ❌ Cancel ")
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded),
+        )
+        .alignment(Alignment::Center);
+
+    f.render_widget(save_btn, btn_rows[0]);
+    f.render_widget(cancel_btn, btn_rows[1]);
 }
 
-pub fn render_connect_screen(f: &mut Frame, app: &App, area: Rect) {
-    let panels = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(42), Constraint::Min(10)])
-        .split(area);
-    render_controls(f, app, panels[0]);
-    render_logs(f, app, panels[1]);
-}
-
-pub fn render_previous_screen(f: &mut Frame, app: &App, area: Rect) {
-    match app.previous_ui_mode.as_ref() {
-        Some(UiMode::ProfileList) => render_profile_list_screen(f, app, area),
-        Some(UiMode::Connect) => render_connect_screen(f, app, area),
-        _ => {}
-    }
-}
-
-pub fn render_statusbar(f: &mut Frame, app: &App, area: Rect) {
-    let hints = if app.ui_mode == UiMode::Help {
-        vec![("ESC / F1", "Tutup Help")]
-    } else {
-        match app.ui_mode {
-            UiMode::ProfileList => vec![
-                ("↑/↓", "Pilih"),
-                ("Enter/F5", "Connect"),
-                ("F2/N", "New"),
-                ("F3/E", "Edit"),
-                ("F4/D", "Delete"),
-                ("ESC/Ctrl+B", "Back"),
-                ("F1", "Help"),
-                ("Ctrl+Q", "Quit"),
-            ],
-            UiMode::NewProfile | UiMode::EditProfile => vec![
-                ("Tab", "Next"),
-                ("Shift+Tab", "Prev"),
-                ("Space", "Toggle"),
-                ("Enter", "Save"),
-                ("ESC/Ctrl+B", "Cancel"),
-                ("F1", "Help"),
-            ],
-            UiMode::Connect => vec![
-                ("Tab", "Focus"),
-                ("Enter", "Action"),
-                ("Ctrl+P", "Show/Hide"),
-                ("Ctrl+S", "Save"),
-                ("ESC/Ctrl+B", "Back"),
-                ("F1", "Help"),
-                ("Ctrl+Q", "Quit"),
-            ],
-            UiMode::Help => vec![],
-        }
-    };
-
-    let mut spans = vec![Span::styled("  ", Style::default())];
-    for (index, (key, desc)) in hints.iter().enumerate() {
-        spans.push(Span::styled(format!("[{}]", key), Style::default().fg(C_CYAN).add_modifier(Modifier::BOLD)));
-        spans.push(Span::styled(format!("{} ", desc), Style::default().fg(C_DIM)));
-        if index < hints.len().saturating_sub(1) {
-            spans.push(Span::styled("│ ", Style::default().fg(C_BORDER)));
-        }
-    }
-
-    let block = panel_block("").style(Style::default().bg(C_SURFACE));
-    f.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
-}
-
-fn render_profile_list(f: &mut Frame, app: &App, area: Rect) {
-    let block = panel_block(" 📋 VPN Connections ");
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    if app.profiles.is_empty() {
-        f.render_widget(
-            Paragraph::new(Span::styled("Belum ada koneksi.\n\nTekan [F2] atau [N] untuk membuat baru", Style::default().fg(C_DIM))).alignment(Alignment::Center),
-            inner,
-        );
-        return;
-    }
-
-    let items: Vec<ListItem> = app.profiles.iter().enumerate().map(|(i, profile)| {
-        let is_selected = i == app.selected_profile_index;
-        let style = if is_selected { Style::default().fg(C_GREEN).add_modifier(Modifier::BOLD) } else { Style::default().fg(C_TEXT) };
-        let cert_style = if profile.trusted_cert.is_some() { Style::default().fg(C_GREEN) } else { Style::default().fg(C_YELLOW) };
-        ListItem::new(Line::from(vec![
-            Span::styled(if is_selected { format!("▶ {}", profile.name) } else { format!("  {}", profile.name) }, style),
-            Span::styled(format!(" @ {}:{}", profile.host, profile.port), Style::default().fg(C_DIM)),
-            Span::styled(format!(" [{}]", if profile.trusted_cert.is_some() { "✓" } else { "?" }), cert_style),
-        ]))
-    }).collect();
-
-    f.render_widget(List::new(items), inner);
-}
-
-fn render_profile_details(f: &mut Frame, app: &App, area: Rect) {
-    let Some(profile) = app.get_current_profile() else {
-        return;
-    };
-
-    let block = panel_block(" 📄 Connection Details ");
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .margin(1)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(4),
-            Constraint::Min(0),
-        ])
-        .split(inner);
-
-    let label_style = Style::default().fg(C_DIM);
-    let value_style = Style::default().fg(C_TEXT);
-    render_label_value(f, rows[0], "Nama:     ", &profile.name, value_style.add_modifier(Modifier::BOLD), label_style);
-    render_label_value(f, rows[1], "Host:     ", &format!("{}:{}", profile.host, profile.port), value_style, label_style);
-    render_label_value(f, rows[2], "Username: ", &profile.username, value_style, label_style);
-    render_label_value(f, rows[3], "Cert:     ", if profile.trusted_cert.is_some() { "✓ Trusted" } else { "⚠ Not trusted" }, Style::default().fg(if profile.trusted_cert.is_some() { C_GREEN } else { C_YELLOW }), label_style);
-    render_label_value(f, rows[4], "Password: ", if profile.save_password { "✓ Saved" } else { "✗ Not saved" }, Style::default().fg(if profile.save_password { C_GREEN } else { C_DIM }), label_style);
-    render_label_value(f, rows[5], "Sudo:     ", if profile.use_sudo_password { "✓ Enabled" } else { "✗ Disabled" }, Style::default().fg(if profile.use_sudo_password { C_GREEN } else { C_DIM }), label_style);
-
-    let btn_rows = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(33), Constraint::Percentage(34), Constraint::Percentage(33)])
-        .split(rows[6]);
-    render_action_button(f, btn_rows[0], " 🔌 Connect ");
-    render_action_button(f, btn_rows[1], " ✏️ Edit ");
-    render_action_button(f, btn_rows[2], " 🗑️ Delete ");
-}
-
+// ─── Controls Panel ──────────────────────────────────────────────────────────
 fn render_controls(f: &mut Frame, app: &App, area: Rect) {
+    let Some(session) = app.active_session() else {
+        let block = Block::default()
+            .title(" ⚙ Configuration ")
+            .title_style(Style::default().fg(C_FOCUS).add_modifier(Modifier::BOLD))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(C_BORDER))
+            .style(Style::default().bg(C_SURFACE));
+        f.render_widget(block, area);
+        return;
+    };
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
@@ -260,63 +940,269 @@ fn render_controls(f: &mut Frame, app: &App, area: Rect) {
         ])
         .split(area);
 
-    f.render_widget(panel_block(" ⚙ Configuration "), area);
-    render_input(f, rows[0], " Host:Port  ", &app.connection.host_port_display(), app.focus == Focus::Host, false, "vpn.example.com:443");
-    render_input(f, rows[1], " Username  ", &app.connection.username, app.focus == Focus::Username, false, "user@domain");
-    render_input(f, rows[2], " Password  ", &app.connection.password, app.focus == Focus::Password, !app.show_password, "••••••••");
+    let outer = Block::default()
+        .title(" ⚙ Configuration ")
+        .title_style(Style::default().fg(C_FOCUS).add_modifier(Modifier::BOLD))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(C_BORDER))
+        .style(Style::default().bg(C_SURFACE));
+    f.render_widget(outer, area);
 
-    let sudo_hint = if app.connection.sudo_password.is_empty() { "kosongkan jika sudoers/pkexec" } else { "••• terisi" };
-    render_input(f, rows[3], " Sudo Password  ", &app.connection.sudo_password, app.focus == Focus::SudoPassword, true, sudo_hint);
+    let host_display = format!("{}:{}", session.host, session.port);
+    render_input(
+        f,
+        rows[0],
+        " Host:Port  ",
+        &host_display,
+        app.focus == Focus::Host,
+        false,
+        "vpn.example.com:443",
+    );
+    render_input(
+        f,
+        rows[1],
+        " Username  ",
+        &session.username,
+        app.focus == Focus::Username,
+        false,
+        "user@domain",
+    );
+    render_input(
+        f,
+        rows[2],
+        " Password  ",
+        &session.password,
+        app.focus == Focus::Password,
+        !app.show_password,
+        "••••••••",
+    );
 
-    let can_connect = matches!(app.vpn_state, VpnState::Disconnected | VpnState::Error(_));
-    render_stateful_button(f, rows[5], " ▶  CONNECT  ", " ▶  CONNECT  [Enter]  ", can_connect, app.focus == Focus::Connect, C_GREEN);
+    let sudo_hint = if session.sudo_password.is_empty() {
+        "kosongkan jika sudoers/pkexec"
+    } else {
+        "••• terisi"
+    };
+    render_input(
+        f,
+        rows[3],
+        " Sudo Password  ",
+        &session.sudo_password,
+        app.focus == Focus::SudoPassword,
+        true,
+        sudo_hint,
+    );
 
-    let can_disconnect = matches!(app.vpn_state, VpnState::Connected | VpnState::Connecting | VpnState::WaitingToken | VpnState::WaitingCert);
-    render_stateful_button(f, rows[6], " ■  DISCONNECT  ", " ■  DISCONNECT  [Enter]  ", can_disconnect, app.focus == Focus::Disconnect, C_RED);
+    let can_connect = matches!(
+        session.vpn_state,
+        VpnState::Disconnected | VpnState::Error(_)
+    );
+    let conn_focused = app.focus == Focus::Connect;
+    let conn_style = match (can_connect, conn_focused) {
+        (true, true) => Style::default()
+            .fg(C_BG)
+            .bg(C_GREEN)
+            .add_modifier(Modifier::BOLD),
+        (true, false) => Style::default().fg(C_GREEN).add_modifier(Modifier::BOLD),
+        _ => Style::default().fg(C_DIM),
+    };
+
+    let connect_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(if conn_focused {
+            BorderType::Thick
+        } else {
+            BorderType::Rounded
+        })
+        .border_style(Style::default().fg(if conn_focused { C_GREEN } else { C_BORDER }));
+
+    f.render_widget(
+        Paragraph::new(if conn_focused {
+            " ▶  CONNECT  [Enter]  "
+        } else {
+            " ▶  CONNECT  "
+        })
+        .block(connect_block)
+        .style(conn_style)
+        .alignment(Alignment::Center),
+        rows[5],
+    );
+
+    let can_disconn = matches!(
+        session.vpn_state,
+        VpnState::Connected | VpnState::Connecting | VpnState::WaitingToken | VpnState::WaitingCert
+    );
+    let disc_focused = app.focus == Focus::Disconnect;
+    let disc_style = match (can_disconn, disc_focused) {
+        (true, true) => Style::default()
+            .fg(C_BG)
+            .bg(C_RED)
+            .add_modifier(Modifier::BOLD),
+        (true, false) => Style::default().fg(C_RED).add_modifier(Modifier::BOLD),
+        _ => Style::default().fg(C_DIM),
+    };
+
+    let disconnect_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(if disc_focused {
+            BorderType::Thick
+        } else {
+            BorderType::Rounded
+        })
+        .border_style(Style::default().fg(if disc_focused { C_RED } else { C_BORDER }));
+
+    f.render_widget(
+        Paragraph::new(if disc_focused {
+            " ■  DISCONNECT  [Enter]  "
+        } else {
+            " ■  DISCONNECT  "
+        })
+        .block(disconnect_block)
+        .style(disc_style)
+        .alignment(Alignment::Center),
+        rows[6],
+    );
 }
 
-fn render_logs(f: &mut Frame, app: &App, area: Rect) {
-    let focused = app.focus == Focus::Logs;
-    let border_style = if focused { Style::default().fg(C_FOCUS) } else { Style::default().fg(C_BORDER) };
-    let title_style = if focused { Style::default().fg(C_FOCUS).add_modifier(Modifier::BOLD) } else { Style::default().fg(C_DIM) };
+// ─── Input Widget ─────────────────────────────────────────────────────────────
+fn render_input(
+    f: &mut Frame,
+    area: Rect,
+    label: &str,
+    value: &str,
+    focused: bool,
+    masked: bool,
+    placeholder: &str,
+) {
+    let border_style = if focused {
+        Style::default().fg(C_FOCUS)
+    } else {
+        Style::default().fg(C_BORDER)
+    };
+    let border_type = if focused {
+        BorderType::Thick
+    } else {
+        BorderType::Rounded
+    };
+
+    let label_style = if focused {
+        Style::default().fg(C_FOCUS).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(C_DIM)
+    };
 
     let block = Block::default()
-        .title(Span::styled(format!(" 📋 Log ({} baris)  ", app.logs.len()), title_style))
+        .title(Span::styled(label, label_style))
         .borders(Borders::ALL)
-        .border_type(if focused { BorderType::Thick } else { BorderType::Rounded })
+        .border_type(border_type)
+        .border_style(border_style)
+        .padding(Padding::horizontal(1));
+
+    let display = if value.is_empty() {
+        Span::styled(placeholder, Style::default().fg(C_DIM))
+    } else if masked {
+        Span::styled("•".repeat(value.len()), Style::default().fg(C_TEXT))
+    } else {
+        Span::styled(value, Style::default().fg(C_TEXT))
+    };
+
+    let content = if focused && !value.is_empty() {
+        Line::from(vec![
+            Span::styled(
+                if masked {
+                    "•".repeat(value.len())
+                } else {
+                    value.to_string()
+                },
+                Style::default().fg(C_TEXT),
+            ),
+            Span::styled("█", Style::default().fg(C_FOCUS)),
+        ])
+    } else if focused && value.is_empty() {
+        Line::from(vec![
+            Span::styled(placeholder, Style::default().fg(C_DIM)),
+            Span::styled("█", Style::default().fg(C_FOCUS)),
+        ])
+    } else {
+        Line::from(display)
+    };
+
+    f.render_widget(Paragraph::new(content).block(block), area);
+}
+
+// ─── Log Panel ───────────────────────────────────────────────────────────────
+fn render_logs(f: &mut Frame, app: &App, area: Rect) {
+    let Some(session) = app.active_session() else {
+        return;
+    };
+    let focused = app.focus == Focus::Logs;
+    let border_style = if focused {
+        Style::default().fg(C_FOCUS)
+    } else {
+        Style::default().fg(C_BORDER)
+    };
+
+    let title_style = if focused {
+        Style::default().fg(C_FOCUS).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(C_DIM)
+    };
+
+    let log_count = session.logs.len();
+    let title = format!(" 📋 Log ({} baris)  ", log_count);
+
+    let block = Block::default()
+        .title(Span::styled(&title, title_style))
+        .borders(Borders::ALL)
+        .border_type(if focused {
+            BorderType::Thick
+        } else {
+            BorderType::Rounded
+        })
         .border_style(border_style)
         .style(Style::default().bg(C_SURFACE));
+
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    if app.logs.is_empty() {
-        f.render_widget(
-            Paragraph::new(Span::styled("Belum ada log. Pilih profile dan tekan Connect untuk memulai...", Style::default().fg(C_DIM))).alignment(Alignment::Center),
-            inner,
-        );
+    if session.logs.is_empty() {
+        let empty = Paragraph::new(Span::styled(
+            "Belum ada log. Pilih profile dan tekan Connect untuk memulai...",
+            Style::default().fg(C_DIM),
+        ))
+        .alignment(Alignment::Center);
+        f.render_widget(empty, inner);
         return;
     }
 
     let visible_height = inner.height as usize;
-    let total = app.logs.len();
-    let scroll = app.log_scroll;
-    let start = if total > visible_height { scroll.min(total - visible_height) } else { 0 };
+    let total = session.logs.len();
+    let scroll = session.log_scroll;
+
+    let start = if total > visible_height {
+        scroll.min(total - visible_height)
+    } else {
+        0
+    };
     let end = (start + visible_height).min(total);
 
-    let items: Vec<ListItem> = app.logs[start..end].iter().map(|line| {
-        let style = if line.contains("[ERR]") || line.contains("ERROR") {
-            Style::default().fg(C_LOG_ERR)
-        } else if line.contains("[WARN]") {
-            Style::default().fg(C_LOG_WARN)
-        } else if line.contains("[TOKEN]") {
-            Style::default().fg(C_ORANGE)
-        } else if line.contains("Connected") || line.contains("tunnel is up") {
-            Style::default().fg(C_GREEN).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(C_LOG_INFO)
-        };
-        ListItem::new(Line::from(Span::styled(line.clone(), style)))
-    }).collect();
+    let items: Vec<ListItem> = session.logs[start..end]
+        .iter()
+        .map(|line| {
+            let style = if line.contains("[ERR]") || line.contains("ERROR") {
+                Style::default().fg(C_LOG_ERR)
+            } else if line.contains("[WARN]") {
+                Style::default().fg(C_LOG_WARN)
+            } else if line.contains("[TOKEN]") {
+                Style::default().fg(C_ORANGE)
+            } else if line.contains("Connected") || line.contains("tunnel is up") {
+                Style::default().fg(C_GREEN).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(C_LOG_INFO)
+            };
+            ListItem::new(Line::from(Span::styled(line.clone(), style)))
+        })
+        .collect();
 
     if total > visible_height {
         let pct = ((scroll as f64 / (total - visible_height) as f64) * 100.0) as u8;
@@ -327,44 +1213,469 @@ fn render_logs(f: &mut Frame, app: &App, area: Rect) {
             width: scroll_info.len() as u16,
             height: 1,
         };
-        f.render_widget(Paragraph::new(Span::styled(scroll_info, Style::default().fg(C_DIM))), scroll_area);
+        f.render_widget(
+            Paragraph::new(Span::styled(scroll_info, Style::default().fg(C_DIM))),
+            scroll_area,
+        );
     }
 
     f.render_widget(List::new(items), inner);
 }
 
-fn render_checkbox(f: &mut Frame, area: Rect, label: &str, checked: bool, focused: bool) {
-    let style = if focused { Style::default().fg(C_FOCUS).add_modifier(Modifier::BOLD) } else { Style::default().fg(C_DIM) };
-    f.render_widget(Paragraph::new(Line::from(vec![Span::styled(format!(" {} {}", if checked { "[✓]" } else { "[ ]" }, label), style)])), area);
-}
+// ─── Status / Hint Bar ───────────────────────────────────────────────────────
+fn render_statusbar(f: &mut Frame, app: &App, area: Rect) {
+    if app.ui_mode == UiMode::Help {
+        let hints = [("ESC / F1", "Tutup Help")];
 
-fn render_stateful_button(f: &mut Frame, area: Rect, label: &str, focused_label: &str, enabled: bool, focused: bool, accent: Color) {
-    let style = match (enabled, focused) {
-        (true, true) => Style::default().fg(C_BG).bg(accent).add_modifier(Modifier::BOLD),
-        (true, false) => Style::default().fg(accent).add_modifier(Modifier::BOLD),
-        _ => Style::default().fg(C_DIM),
+        let mut spans = vec![Span::styled("  ", Style::default())];
+        for (i, (key, desc)) in hints.iter().enumerate() {
+            spans.push(Span::styled(
+                format!("[{}]", key),
+                Style::default().fg(C_CYAN).add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(
+                format!(" {} ", desc),
+                Style::default().fg(C_DIM),
+            ));
+            if i < hints.len() - 1 {
+                spans.push(Span::styled(" │ ", Style::default().fg(C_BORDER)));
+            }
+        }
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(C_BORDER))
+            .style(Style::default().bg(C_SURFACE));
+
+        f.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
+        return;
+    }
+
+    let hints = match app.ui_mode {
+        UiMode::ProfileList => vec![
+            ("↑/↓", "Pilih"),
+            ("Enter/F5", "Connect"),
+            ("F2/N", "New"),
+            ("F3/E", "Edit"),
+            ("F4/D", "Delete"),
+            ("ESC/Ctrl+B", "Back"),
+            ("F1", "Help"),
+            ("Ctrl+Q", "Quit"),
+        ],
+        UiMode::NewProfile | UiMode::EditProfile => vec![
+            ("Tab", "Next"),
+            ("Shift+Tab", "Prev"),
+            ("Space", "Toggle"),
+            ("Enter", "Save"),
+            ("ESC/Ctrl+B", "Cancel"),
+            ("F1", "Help"),
+        ],
+        UiMode::Connect => vec![
+            ("←/→", "Tab"),
+            ("Tab", "Focus"),
+            ("Enter", "Action"),
+            ("Ctrl+K", "Disc 1"),
+            ("Ctrl+Shift+K", "Disc all"),
+            ("Ctrl+W", "Close"),
+            ("Ctrl+Shift+W", "Close idle"),
+            ("Ctrl+P", "Show/Hide"),
+            ("Ctrl+S", "Save"),
+            ("ESC/Ctrl+B", "Back"),
+            ("F1", "Help"),
+            ("Ctrl+Q", "Quit"),
+        ],
+        UiMode::Help => vec![],
     };
+
+    let mut spans = vec![Span::styled("  ", Style::default())];
+    for (i, (key, desc)) in hints.iter().enumerate() {
+        spans.push(Span::styled(
+            format!("[{}]", key),
+            Style::default().fg(C_CYAN).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            format!("{} ", desc),
+            Style::default().fg(C_DIM),
+        ));
+        if i < hints.len() - 1 {
+            spans.push(Span::styled("│ ", Style::default().fg(C_BORDER)));
+        }
+    }
+
     let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(if focused { BorderType::Thick } else { BorderType::Rounded })
-        .border_style(Style::default().fg(if focused { accent } else { C_BORDER }));
-    f.render_widget(Paragraph::new(if focused { focused_label } else { label }).block(block).style(style).alignment(Alignment::Center), area);
-}
-
-fn render_action_button(f: &mut Frame, area: Rect, label: &str) {
-    f.render_widget(Paragraph::new(label).block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)).alignment(Alignment::Center), area);
-}
-
-fn render_label_value(f: &mut Frame, area: Rect, label: &str, value: &str, value_style: Style, label_style: Style) {
-    f.render_widget(Paragraph::new(Line::from(vec![Span::styled(label, label_style), Span::styled(value, value_style)])), area);
-}
-
-fn panel_block<'a>(title: &'a str) -> Block<'a> {
-    Block::default()
-        .title(title)
-        .title_style(Style::default().fg(C_FOCUS).add_modifier(Modifier::BOLD))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(C_BORDER))
-        .style(Style::default().bg(C_SURFACE))
+        .style(Style::default().bg(C_SURFACE));
+
+    f.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
+}
+
+// ─── Floating Notification ───────────────────────────────────────────────────
+fn render_notification(f: &mut Frame, msg: &str, level: &NotifLevel, area: Rect) {
+    let (bg, fg, icon) = match level {
+        NotifLevel::Info => (Color::Rgb(30, 50, 80), C_FOCUS, "ℹ "),
+        NotifLevel::Success => (Color::Rgb(20, 60, 30), C_GREEN, "✔ "),
+        NotifLevel::Warning => (Color::Rgb(70, 55, 10), C_YELLOW, "⚠ "),
+        NotifLevel::Error => (Color::Rgb(70, 20, 20), C_RED, "✖ "),
+    };
+    let width = (msg.len() as u16 + 8).min(area.width - 4).max(20);
+    let height = 3u16;
+    let x = area.x + (area.width - width) / 2;
+    let y = area.y + 1;
+
+    let notif_area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    f.render_widget(Clear, notif_area);
+
+    let content = format!("{} {}", icon, msg);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(fg))
+        .style(Style::default().bg(bg));
+
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            content,
+            Style::default().fg(fg).add_modifier(Modifier::BOLD),
+        ))
+        .block(block)
+        .alignment(Alignment::Center),
+        notif_area,
+    );
+}
+
+// ─── Certificate Approval Popup ───────────────────────────────────────────────
+fn render_cert_popup(f: &mut Frame, app: &App, cert: &crate::app::CertInfo, area: Rect) {
+    let popup_w = (area.width as f32 * 0.72) as u16;
+    let popup_h = 18u16;
+    let popup_x = area.x + (area.width.saturating_sub(popup_w)) / 2;
+    let popup_y = area.y + (area.height.saturating_sub(popup_h)) / 2;
+    let popup_area = Rect {
+        x: popup_x,
+        y: popup_y,
+        width: popup_w,
+        height: popup_h,
+    };
+    f.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .title(Span::styled(
+            " ⚠  CERTIFICATE TIDAK DIPERCAYA   ",
+            Style::default()
+                .fg(Color::Rgb(255, 200, 50))
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
+        .border_style(Style::default().fg(Color::Rgb(255, 200, 50)))
+        .style(Style::default().bg(Color::Rgb(20, 18, 10)));
+    f.render_widget(block, popup_area);
+
+    let inner = Rect {
+        x: popup_area.x + 2,
+        y: popup_area.y + 1,
+        width: popup_area.width.saturating_sub(4),
+        height: popup_area.height.saturating_sub(2),
+    };
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            "Gateway VPN menggunakan certificate yang tidak ada di whitelist:",
+            Style::default().fg(Color::Rgb(220, 200, 140)),
+        )),
+        rows[0],
+    );
+
+    let detail_style = Style::default().fg(Color::Rgb(180, 220, 255));
+    let label_style = Style::default().fg(Color::Rgb(100, 160, 220));
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("  Subject CN  :  ", label_style),
+            Span::styled(&cert.subject_cn, detail_style.add_modifier(Modifier::BOLD)),
+        ])),
+        rows[2],
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("  Org         :  ", label_style),
+            Span::styled(&cert.subject_org, detail_style),
+        ])),
+        rows[3],
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("  Issuer CN   :  ", label_style),
+            Span::styled(&cert.issuer_cn, detail_style),
+        ])),
+        rows[4],
+    );
+
+    f.render_widget(
+        Paragraph::new(Span::styled("  SHA256 Digest: ", label_style)),
+        rows[6],
+    );
+
+    let hash_display = if cert.hash.len() > (inner.width as usize).saturating_sub(4) {
+        format!(
+            "  {}... ",
+            &cert.hash[..inner.width.saturating_sub(8) as usize]
+        )
+    } else {
+        format!("  {} ", cert.hash)
+    };
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            hash_display,
+            Style::default()
+                .fg(Color::Rgb(255, 220, 80))
+                .add_modifier(Modifier::BOLD),
+        )),
+        rows[7],
+    );
+
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            "Apakah Anda mempercayai certificate ini?",
+            Style::default()
+                .fg(Color::Rgb(220, 220, 220))
+                .add_modifier(Modifier::BOLD),
+        ))
+        .alignment(Alignment::Center),
+        rows[9],
+    );
+
+    let btn_area = rows[11];
+    let btn_rows = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(btn_area);
+
+    let accept_focused = app.focus == Focus::CertAccept;
+    let deny_focused = app.focus == Focus::CertDeny;
+
+    let accept_style = if accept_focused {
+        Style::default()
+            .fg(Color::Rgb(20, 20, 20))
+            .bg(Color::Rgb(80, 220, 120))
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::Rgb(80, 220, 120))
+            .add_modifier(Modifier::BOLD)
+    };
+    let accept_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(if accept_focused {
+            BorderType::Thick
+        } else {
+            BorderType::Rounded
+        })
+        .border_style(Style::default().fg(Color::Rgb(80, 220, 120)));
+
+    f.render_widget(
+        Paragraph::new(" ✔  PERCAYA  & CONNECT  [Y/Enter] ")
+            .block(accept_block)
+            .style(accept_style)
+            .alignment(Alignment::Center),
+        btn_rows[0],
+    );
+
+    let deny_style = if deny_focused {
+        Style::default()
+            .fg(Color::Rgb(20, 20, 20))
+            .bg(Color::Rgb(255, 80, 80))
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::Rgb(255, 80, 80))
+            .add_modifier(Modifier::BOLD)
+    };
+    let deny_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(if deny_focused {
+            BorderType::Thick
+        } else {
+            BorderType::Rounded
+        })
+        .border_style(Style::default().fg(Color::Rgb(255, 80, 80)));
+
+    f.render_widget(
+        Paragraph::new(" ✖  TOLAK  [N/Esc] ")
+            .block(deny_block)
+            .style(deny_style)
+            .alignment(Alignment::Center),
+        btn_rows[1],
+    );
+
+    let hint_area = Rect {
+        x: popup_area.x + 2,
+        y: popup_area.y + popup_area.height - 1,
+        width: popup_area.width.saturating_sub(4),
+        height: 1,
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                "[Tab/←/→] ",
+                Style::default()
+                    .fg(Color::Rgb(60, 210, 210))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("pindah    ", Style::default().fg(Color::Rgb(80, 80, 100))),
+            Span::styled(
+                "[Y] ",
+                Style::default()
+                    .fg(Color::Rgb(60, 210, 210))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("accept    ", Style::default().fg(Color::Rgb(80, 80, 100))),
+            Span::styled(
+                "[N/Esc] ",
+                Style::default()
+                    .fg(Color::Rgb(60, 210, 210))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("tolak   ", Style::default().fg(Color::Rgb(80, 80, 100))),
+        ])),
+        hint_area,
+    );
+}
+
+// ─── Token Input Popup ────────────────────────────────────────────────────────
+fn render_token_popup(f: &mut Frame, app: &App, area: Rect) {
+    let Some(session) = app.active_session() else {
+        return;
+    };
+    let popup_w = 52u16;
+    let popup_h = 11u16;
+    let popup_x = area.x + area.width.saturating_sub(popup_w) / 2;
+    let popup_y = area.y + area.height.saturating_sub(popup_h) / 2;
+    let popup_area = Rect {
+        x: popup_x,
+        y: popup_y,
+        width: popup_w,
+        height: popup_h,
+    };
+    f.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .title(Span::styled(
+            " ⚡  TWO-FACTOR AUTHENTICATION   ",
+            Style::default().fg(C_ORANGE).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
+        .border_style(Style::default().fg(C_ORANGE))
+        .style(Style::default().bg(Color::Rgb(20, 14, 5)));
+    f.render_widget(block, popup_area);
+
+    let inner = Rect {
+        x: popup_area.x + 2,
+        y: popup_area.y + 1,
+        width: popup_area.width.saturating_sub(4),
+        height: popup_area.height.saturating_sub(2),
+    };
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            "Masukkan OTP token yang dikirim ke email/app Anda:",
+            Style::default().fg(Color::Rgb(220, 200, 140)),
+        )),
+        rows[0],
+    );
+
+    let token_display = &session.token_input;
+    let cursor = if (f.count() / 5) % 2 == 0 {
+        "█ "
+    } else {
+        "  "
+    };
+    let input_content = if token_display.is_empty() {
+        Line::from(vec![
+            Span::styled("   ", Style::default()),
+            Span::styled("Ketik token di sini... ", Style::default().fg(C_DIM)),
+            Span::styled(cursor, Style::default().fg(C_ORANGE)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("   ", Style::default()),
+            Span::styled(
+                token_display.as_str(),
+                Style::default()
+                    .fg(Color::Rgb(255, 230, 80))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(cursor, Style::default().fg(C_ORANGE)),
+        ])
+    };
+
+    let input_block = Block::default()
+        .title(Span::styled(" OTP Token  ", Style::default().fg(C_ORANGE)))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
+        .border_style(Style::default().fg(C_ORANGE));
+
+    f.render_widget(Paragraph::new(input_content).block(input_block), rows[2]);
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                "[Enter] ",
+                Style::default().fg(C_CYAN).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("submit    ", Style::default().fg(C_DIM)),
+            Span::styled(
+                "[Backspace] ",
+                Style::default().fg(C_CYAN).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("hapus    ", Style::default().fg(C_DIM)),
+            Span::styled(
+                "[Esc] ",
+                Style::default()
+                    .fg(Color::Rgb(255, 120, 80))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("batalkan ", Style::default().fg(C_DIM)),
+        ]))
+        .alignment(Alignment::Center),
+        rows[4],
+    );
 }
