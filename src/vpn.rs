@@ -730,24 +730,8 @@ pub async fn send_token(
             stdin.write_all(token_line.as_bytes()).await?;
         }
 
-        let temp_file = format!("/tmp/fortivpn_token_{}.txt", pid);
-
-        let _ = tokio::fs::write(&temp_file, token_line.as_bytes()).await;
-
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "sudo cat {} > /proc/{}/fd/0 2>/dev/null",
-                &temp_file, pid
-            ))
-            .output()
-            .await;
-
-        let _ = tokio::fs::remove_file(&temp_file).await;
-
-        if let Ok(o) = output
-            && o.status.success()
-        {
+        let output = child.wait_with_output().await?;
+        if output.status.success() {
             let _ = event_tx.send(AppEvent::LogLine {
                 session_id,
                 line: "[TOKEN] ✅ Token berhasil dikirim".into(),

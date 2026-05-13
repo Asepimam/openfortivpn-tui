@@ -20,10 +20,6 @@ const C_RED: Color = Color::Rgb(255, 80, 80);
 const C_YELLOW: Color = Color::Rgb(255, 210, 60);
 const C_ORANGE: Color = Color::Rgb(255, 140, 40);
 const C_CYAN: Color = Color::Rgb(60, 210, 210);
-const C_LOG_INFO: Color = Color::Rgb(140, 200, 255);
-const C_LOG_ERR: Color = Color::Rgb(255, 100, 100);
-const C_LOG_WARN: Color = Color::Rgb(255, 200, 80);
-
 // ─── Main render entry ────────────────────────────────────────────────────────
 pub fn render(f: &mut Frame, app: &App) {
     let full = f.area();
@@ -48,6 +44,10 @@ pub fn render(f: &mut Frame, app: &App) {
     }
     if app.pending_action.is_some() {
         render_action_confirm_popup(f, app, full);
+        return;
+    }
+    if let Some(message) = &app.connection_error {
+        render_connection_error_popup(f, message, full);
         return;
     }
 
@@ -488,7 +488,6 @@ fn render_help_popup(f: &mut Frame, _app: &App, area: Rect) {
         ("Ctrl+Shift+W", "Tutup semua tab yang sudah idle"),
         ("Ctrl+P", "Tampilkan/sembunyikan password"),
         ("Ctrl+S", "Simpan konfigurasi ke profile"),
-        ("↑ / ↓ / PgUp / PgDn", "Scroll log"),
     ];
 
     let connect_text: Vec<Line> = connect_shortcuts
@@ -914,13 +913,7 @@ fn render_profile_form(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_connection_workspace(f: &mut Frame, app: &App, area: Rect) {
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(9), Constraint::Min(6)])
-        .split(area);
-
-    render_connection_dashboard(f, app, rows[0]);
-    render_logs(f, app, rows[1]);
+    render_connection_dashboard(f, app, area);
 }
 
 fn render_connection_dashboard(f: &mut Frame, app: &App, area: Rect) {
@@ -1300,98 +1293,6 @@ fn render_input(
     f.render_widget(Paragraph::new(content).block(block), area);
 }
 
-// ─── Log Panel ───────────────────────────────────────────────────────────────
-fn render_logs(f: &mut Frame, app: &App, area: Rect) {
-    let Some(session) = app.active_session() else {
-        return;
-    };
-    let focused = app.focus == Focus::Logs;
-    let border_style = if focused {
-        Style::default().fg(C_FOCUS)
-    } else {
-        Style::default().fg(C_BORDER)
-    };
-
-    let title_style = if focused {
-        Style::default().fg(C_FOCUS).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(C_DIM)
-    };
-
-    let log_count = session.logs.len();
-    let title = format!(" 📋 Log ({} baris)  ", log_count);
-
-    let block = Block::default()
-        .title(Span::styled(&title, title_style))
-        .borders(Borders::ALL)
-        .border_type(if focused {
-            BorderType::Thick
-        } else {
-            BorderType::Rounded
-        })
-        .border_style(border_style)
-        .style(Style::default().bg(C_SURFACE));
-
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    if session.logs.is_empty() {
-        let empty = Paragraph::new(Span::styled(
-            "Belum ada log. Pilih profile dan tekan Connect untuk memulai...",
-            Style::default().fg(C_DIM),
-        ))
-        .alignment(Alignment::Center);
-        f.render_widget(empty, inner);
-        return;
-    }
-
-    let visible_height = inner.height as usize;
-    let total = session.logs.len();
-    let scroll = session.log_scroll;
-
-    let start = if total > visible_height {
-        scroll.min(total - visible_height)
-    } else {
-        0
-    };
-    let end = (start + visible_height).min(total);
-
-    let items: Vec<ListItem> = session.logs[start..end]
-        .iter()
-        .map(|line| {
-            let style = if line.contains("[ERR]") || line.contains("ERROR") {
-                Style::default().fg(C_LOG_ERR)
-            } else if line.contains("[WARN]") {
-                Style::default().fg(C_LOG_WARN)
-            } else if line.contains("[TOKEN]") {
-                Style::default().fg(C_ORANGE)
-            } else if line.contains("Connected") || line.contains("tunnel is up") {
-                Style::default().fg(C_GREEN).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(C_LOG_INFO)
-            };
-            ListItem::new(Line::from(Span::styled(line.clone(), style)))
-        })
-        .collect();
-
-    if total > visible_height {
-        let pct = ((scroll as f64 / (total - visible_height) as f64) * 100.0) as u8;
-        let scroll_info = format!(" {}% ↕  ", pct);
-        let scroll_area = Rect {
-            x: area.x + area.width - scroll_info.len() as u16 - 2,
-            y: area.y,
-            width: scroll_info.len() as u16,
-            height: 1,
-        };
-        f.render_widget(
-            Paragraph::new(Span::styled(scroll_info, Style::default().fg(C_DIM))),
-            scroll_area,
-        );
-    }
-
-    f.render_widget(List::new(items), inner);
-}
-
 // ─── Status / Hint Bar ───────────────────────────────────────────────────────
 fn render_statusbar(f: &mut Frame, app: &App, area: Rect) {
     if app.ui_mode == UiMode::Help {
@@ -1518,6 +1419,50 @@ fn render_notification(f: &mut Frame, msg: &str, level: &NotifLevel, area: Rect)
         .block(block)
         .alignment(Alignment::Center),
         notif_area,
+    );
+}
+
+fn render_connection_error_popup(f: &mut Frame, message: &str, area: Rect) {
+    let popup_w = (area.width.saturating_sub(4)).min(64).max(36);
+    let popup_h = 9u16.min(area.height.saturating_sub(2)).max(7);
+    let popup_x = area.x + area.width.saturating_sub(popup_w) / 2;
+    let popup_y = area.y + area.height.saturating_sub(popup_h) / 2;
+    let popup_area = Rect {
+        x: popup_x,
+        y: popup_y,
+        width: popup_w,
+        height: popup_h,
+    };
+    f.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .title(Span::styled(
+            " ✖ Gagal Koneksi ",
+            Style::default().fg(C_RED).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(C_RED))
+        .padding(Padding::uniform(1))
+        .style(Style::default().bg(C_SURFACE));
+
+    let content = vec![
+        Line::from(Span::styled(
+            message,
+            Style::default().fg(C_TEXT).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Tekan Enter atau Esc untuk kembali.",
+            Style::default().fg(C_DIM),
+        )),
+    ];
+
+    f.render_widget(
+        Paragraph::new(content)
+            .block(block)
+            .alignment(Alignment::Center),
+        popup_area,
     );
 }
 

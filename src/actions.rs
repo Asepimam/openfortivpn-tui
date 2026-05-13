@@ -208,38 +208,6 @@ pub async fn handle_connect_mode(app: &mut App, key: KeyEvent) -> Result<()> {
             app.cycle_focus_backward();
             return Ok(());
         }
-        (_, KeyCode::Up) => {
-            if app.focus == Focus::Logs {
-                app.scroll_logs_up();
-            }
-            return Ok(());
-        }
-        (_, KeyCode::Down) => {
-            if app.focus == Focus::Logs {
-                app.scroll_logs_down();
-            }
-            return Ok(());
-        }
-        (_, KeyCode::PageUp) => {
-            for _ in 0..10 {
-                app.scroll_logs_up();
-            }
-            return Ok(());
-        }
-        (_, KeyCode::PageDown) => {
-            for _ in 0..10 {
-                app.scroll_logs_down();
-            }
-            return Ok(());
-        }
-        (_, KeyCode::F(5)) => {
-            if let Some(session) = app.active_session_mut()
-                && !session.logs.is_empty()
-            {
-                session.log_scroll = session.logs.len() - 1;
-            }
-            return Ok(());
-        }
         _ => {
             if app.focus == Focus::Host {
                 let Some(session) = app.active_session() else {

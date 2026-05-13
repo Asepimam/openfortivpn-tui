@@ -133,6 +133,7 @@ async fn drain_events(app: &mut App) {
                             if app.sessions[idx].connected_at.is_none() {
                                 app.sessions[idx].connected_at = Some(Instant::now());
                             }
+                            app.connection_error = None;
                             app.notify(
                                 format!("✔ VPN '{}' terhubung!", profile_name),
                                 NotifLevel::Success,
@@ -144,15 +145,27 @@ async fn drain_events(app: &mut App) {
                             *app.sessions[idx].waiting_for_input_flag.lock().unwrap() = false;
                         }
                         (_, VpnState::Disconnected) => {
+                            let failed_before_connected =
+                                matches!(old, VpnState::Connecting | VpnState::WaitingToken)
+                                    && app.sessions[idx].connected_at.is_none();
                             app.sessions[idx].connected_at = None;
                             app.sessions[idx].rx_speed_bps = 0;
                             app.sessions[idx].tx_speed_bps = 0;
+                            if failed_before_connected {
+                                let profile_name = app.sessions[idx].profile_name.clone();
+                                app.show_connection_error(format!(
+                                    "Gagal terkoneksi ke VPN '{}'",
+                                    profile_name
+                                ));
+                            }
                             if !matches!(old, VpnState::Disconnected | VpnState::WaitingCert) {
                                 let profile_name = app.sessions[idx].profile_name.clone();
-                                app.notify(
-                                    format!("VPN '{}' terputus", profile_name),
-                                    NotifLevel::Warning,
-                                );
+                                if !failed_before_connected {
+                                    app.notify(
+                                        format!("VPN '{}' terputus", profile_name),
+                                        NotifLevel::Warning,
+                                    );
+                                }
                                 app.sessions[idx].push_log("[APP] VPN terputus");
                             }
                             if is_active && app.has_modal() {
@@ -165,6 +178,10 @@ async fn drain_events(app: &mut App) {
                             app.sessions[idx].connected_at = None;
                             app.sessions[idx].rx_speed_bps = 0;
                             app.sessions[idx].tx_speed_bps = 0;
+                            app.show_connection_error(format!(
+                                "Gagal terkoneksi ke VPN '{}': {}",
+                                profile_name, e
+                            ));
                             app.notify(
                                 format!("Error '{}': {}", profile_name, e),
                                 NotifLevel::Error,
@@ -218,6 +235,13 @@ async fn drain_events(app: &mut App) {
 }
 
 async fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> Result<()> {
+    if app.connection_error.is_some() {
+        if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+            app.clear_connection_error();
+        }
+        return Ok(());
+    }
+
     if app.ui_mode == UiMode::Help {
         if key.code == KeyCode::Esc || key.code == KeyCode::F(1) {
             app.hide_help();
