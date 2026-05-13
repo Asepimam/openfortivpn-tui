@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::{
@@ -99,6 +99,24 @@ async fn drain_events(app: &mut App) {
                     }
                 }
                 AppEvent::DebugLog(line) => app.push_debug_log(line),
+                AppEvent::SpeedUpdate {
+                    session_id,
+                    interface,
+                    rx_bps,
+                    tx_bps,
+                    rx_total,
+                    tx_total,
+                } => {
+                    let Some(idx) = app.find_session_index_by_id(session_id) else {
+                        continue;
+                    };
+                    let session = &mut app.sessions[idx];
+                    session.vpn_interface = Some(interface);
+                    session.rx_speed_bps = rx_bps;
+                    session.tx_speed_bps = tx_bps;
+                    session.rx_total_bytes = rx_total;
+                    session.tx_total_bytes = tx_total;
+                }
                 AppEvent::StateChanged {
                     session_id,
                     state: new_state,
@@ -112,6 +130,9 @@ async fn drain_events(app: &mut App) {
                     match (&old, &new_state) {
                         (_, VpnState::Connected) => {
                             let profile_name = app.sessions[idx].profile_name.clone();
+                            if app.sessions[idx].connected_at.is_none() {
+                                app.sessions[idx].connected_at = Some(Instant::now());
+                            }
                             app.notify(
                                 format!("✔ VPN '{}' terhubung!", profile_name),
                                 NotifLevel::Success,
@@ -123,6 +144,9 @@ async fn drain_events(app: &mut App) {
                             *app.sessions[idx].waiting_for_input_flag.lock().unwrap() = false;
                         }
                         (_, VpnState::Disconnected) => {
+                            app.sessions[idx].connected_at = None;
+                            app.sessions[idx].rx_speed_bps = 0;
+                            app.sessions[idx].tx_speed_bps = 0;
                             if !matches!(old, VpnState::Disconnected | VpnState::WaitingCert) {
                                 let profile_name = app.sessions[idx].profile_name.clone();
                                 app.notify(
@@ -138,6 +162,9 @@ async fn drain_events(app: &mut App) {
                         }
                         (_, VpnState::Error(e)) => {
                             let profile_name = app.sessions[idx].profile_name.clone();
+                            app.sessions[idx].connected_at = None;
+                            app.sessions[idx].rx_speed_bps = 0;
+                            app.sessions[idx].tx_speed_bps = 0;
                             app.notify(
                                 format!("Error '{}': {}", profile_name, e),
                                 NotifLevel::Error,

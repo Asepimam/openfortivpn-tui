@@ -6,6 +6,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, Padding, Paragraph},
 };
+use std::time::Duration;
 
 // ─── Palette ─────────────────────────────────────────────────────────────────
 const C_BG: Color = Color::Rgb(18, 18, 28);
@@ -271,7 +272,7 @@ fn render_body(f: &mut Frame, app: &App, area: Rect) {
                 .constraints([Constraint::Length(42), Constraint::Min(10)])
                 .split(rows[1]);
             render_controls(f, app, panels[0]);
-            render_logs(f, app, panels[1]);
+            render_connection_workspace(f, app, panels[1]);
         }
         UiMode::Help => {
             // Konten tetap dirender sesuai mode sebelumnya
@@ -296,7 +297,7 @@ fn render_body(f: &mut Frame, app: &App, area: Rect) {
                             .constraints([Constraint::Length(42), Constraint::Min(10)])
                             .split(rows[1]);
                         render_controls(f, app, panels[0]);
-                        render_logs(f, app, panels[1]);
+                        render_connection_workspace(f, app, panels[1]);
                     }
                     _ => {}
                 }
@@ -910,6 +911,175 @@ fn render_profile_form(f: &mut Frame, app: &App, area: Rect) {
 
     f.render_widget(save_btn, btn_rows[0]);
     f.render_widget(cancel_btn, btn_rows[1]);
+}
+
+fn render_connection_workspace(f: &mut Frame, app: &App, area: Rect) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(9), Constraint::Min(6)])
+        .split(area);
+
+    render_connection_dashboard(f, app, rows[0]);
+    render_logs(f, app, rows[1]);
+}
+
+fn render_connection_dashboard(f: &mut Frame, app: &App, area: Rect) {
+    let Some(session) = app.active_session() else {
+        return;
+    };
+
+    let state = &session.vpn_state;
+    let (state_color, state_icon) = match state {
+        VpnState::Disconnected => (C_DIM, "○"),
+        VpnState::Connecting => (C_YELLOW, "◌"),
+        VpnState::WaitingToken | VpnState::WaitingCert => (C_ORANGE, "◎"),
+        VpnState::Connected => (C_GREEN, "●"),
+        VpnState::Disconnecting => (C_YELLOW, "◌"),
+        VpnState::Error(_) => (C_RED, "✖"),
+    };
+    let duration = session
+        .connected_at
+        .map(|started| format_duration(started.elapsed()))
+        .unwrap_or_else(|| "-".into());
+    let interface = session.vpn_interface.as_deref().unwrap_or("-");
+    let pid = session
+        .vpn_pid
+        .lock()
+        .unwrap()
+        .map(|pid| pid.to_string())
+        .unwrap_or_else(|| "-".into());
+
+    let block = Block::default()
+        .title(Span::styled(
+            " Connection Dashboard ",
+            Style::default().fg(C_FOCUS).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(C_BORDER))
+        .style(Style::default().bg(C_SURFACE));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+
+    let label = Style::default().fg(C_DIM);
+    let value = Style::default().fg(C_TEXT);
+    let endpoint = format!("{}:{}", session.host, session.port);
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Status  ", label),
+            Span::styled(
+                format!("{} {}", state_icon, state.label()),
+                Style::default()
+                    .fg(state_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("   Duration  ", label),
+            Span::styled(duration, value),
+        ])),
+        rows[0],
+    );
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Endpoint  ", label),
+            Span::styled(endpoint, value),
+            Span::styled("   User  ", label),
+            Span::styled(&session.username, value),
+        ])),
+        rows[1],
+    );
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Interface  ", label),
+            Span::styled(
+                interface,
+                Style::default().fg(C_CYAN).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("   PID  ", label),
+            Span::styled(pid, value),
+        ])),
+        rows[2],
+    );
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Speed  ", label),
+            Span::styled(
+                format!("↓ {}/s", format_bytes(session.rx_speed_bps)),
+                Style::default().fg(C_GREEN).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("   ", label),
+            Span::styled(
+                format!("↑ {}/s", format_bytes(session.tx_speed_bps)),
+                Style::default().fg(C_YELLOW).add_modifier(Modifier::BOLD),
+            ),
+        ])),
+        rows[3],
+    );
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Total  ", label),
+            Span::styled(
+                format!("↓ {}", format_bytes(session.rx_total_bytes)),
+                Style::default().fg(C_GREEN),
+            ),
+            Span::styled("   ", label),
+            Span::styled(
+                format!("↑ {}", format_bytes(session.tx_total_bytes)),
+                Style::default().fg(C_YELLOW),
+            ),
+        ])),
+        rows[4],
+    );
+}
+
+fn format_duration(duration: Duration) -> String {
+    let total_secs = duration.as_secs();
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+
+    if hours > 0 {
+        format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
+    } else {
+        format!("{:02}:{:02}", minutes, seconds)
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+
+    let mut value = bytes as f64;
+    let mut unit = UNITS[0];
+
+    for next_unit in UNITS.iter().skip(1) {
+        if value < 1024.0 {
+            break;
+        }
+        value /= 1024.0;
+        unit = next_unit;
+    }
+
+    if unit == "B" {
+        format!("{} {}", bytes, unit)
+    } else {
+        format!("{:.1} {}", value, unit)
+    }
 }
 
 // ─── Controls Panel ──────────────────────────────────────────────────────────

@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 use tokio::sync::mpsc;
 
 // ─── VPN Connection State ─────────────────────────────────────────────────────
@@ -99,11 +102,28 @@ impl PendingAction {
 // ─── Events ───────────────────────────────────────────────────────────────────
 #[derive(Debug)]
 pub enum AppEvent {
-    LogLine { session_id: u64, line: String },
+    LogLine {
+        session_id: u64,
+        line: String,
+    },
     DebugLog(String),
-    StateChanged { session_id: u64, state: VpnState },
+    StateChanged {
+        session_id: u64,
+        state: VpnState,
+    },
+    SpeedUpdate {
+        session_id: u64,
+        interface: String,
+        rx_bps: u64,
+        tx_bps: u64,
+        rx_total: u64,
+        tx_total: u64,
+    },
     NeedToken(u64),
-    CertError { session_id: u64, cert: CertInfo },
+    CertError {
+        session_id: u64,
+        cert: CertInfo,
+    },
 }
 
 pub struct ConnectionSession {
@@ -120,6 +140,12 @@ pub struct ConnectionSession {
     pub log_scroll: usize,
     pub pending_cert: Option<CertInfo>,
     pub trusted_cert: Option<String>,
+    pub connected_at: Option<Instant>,
+    pub vpn_interface: Option<String>,
+    pub rx_speed_bps: u64,
+    pub tx_speed_bps: u64,
+    pub rx_total_bytes: u64,
+    pub tx_total_bytes: u64,
     pub vpn_pid: Arc<Mutex<Option<u32>>>,
     pub waiting_for_input_flag: Arc<Mutex<bool>>,
 }
@@ -140,6 +166,12 @@ impl ConnectionSession {
             log_scroll: 0,
             pending_cert: None,
             trusted_cert: profile.trusted_cert.clone(),
+            connected_at: None,
+            vpn_interface: None,
+            rx_speed_bps: 0,
+            tx_speed_bps: 0,
+            rx_total_bytes: 0,
+            tx_total_bytes: 0,
             vpn_pid: Arc::new(Mutex::new(None)),
             waiting_for_input_flag: Arc::new(Mutex::new(false)),
         }
@@ -151,6 +183,15 @@ impl ConnectionSession {
         if !self.logs.is_empty() {
             self.log_scroll = self.logs.len().saturating_sub(1);
         }
+    }
+
+    pub fn reset_connection_metrics(&mut self) {
+        self.connected_at = None;
+        self.vpn_interface = None;
+        self.rx_speed_bps = 0;
+        self.tx_speed_bps = 0;
+        self.rx_total_bytes = 0;
+        self.tx_total_bytes = 0;
     }
 }
 

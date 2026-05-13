@@ -603,6 +603,19 @@ async fn monitor_connection_speed(
                     iface
                 ),
             });
+
+            let initial = initial_stats.get(&iface).copied().unwrap_or_default();
+            let rx_total = current.rx_bytes.saturating_sub(initial.rx_bytes);
+            let tx_total = current.tx_bytes.saturating_sub(initial.tx_bytes);
+
+            let _ = tx.send(AppEvent::SpeedUpdate {
+                session_id,
+                interface: iface.clone(),
+                rx_bps: rx_per_sec,
+                tx_bps: tx_per_sec,
+                rx_total,
+                tx_total,
+            });
         }
 
         previous_stats = current_stats;

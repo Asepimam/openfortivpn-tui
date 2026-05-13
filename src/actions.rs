@@ -432,6 +432,7 @@ async fn accept_cert_and_reconnect(app: &mut App) -> Result<()> {
         cert.subject_cn
     ));
     session.trusted_cert = Some(cert.hash.clone());
+    session.reset_connection_metrics();
     session.vpn_state = VpnState::Connecting;
     let session_id = session.id;
     let host = session.host.clone();
@@ -557,6 +558,7 @@ async fn do_connect(app: &mut App) -> Result<()> {
     let input_flag = session.waiting_for_input_flag.clone();
 
     if let Some(session) = app.active_session_mut() {
+        session.reset_connection_metrics();
         session.vpn_state = VpnState::Connecting;
     }
     app.push_log(format!("[APP] Menghubungkan ke {}:{}...", host, port));
@@ -609,6 +611,8 @@ async fn do_disconnect(app: &mut App) -> Result<()> {
     if let Some(session) = app.active_session_mut() {
         session.token_input.clear();
         session.pending_cert = None;
+        session.rx_speed_bps = 0;
+        session.tx_speed_bps = 0;
         *session.waiting_for_input_flag.lock().unwrap() = false;
         session.vpn_state = VpnState::Disconnecting;
     }
@@ -691,6 +695,8 @@ fn disconnect_all_sessions(app: &mut App) {
             let pid_store = session.vpn_pid.clone();
             session.token_input.clear();
             session.pending_cert = None;
+            session.rx_speed_bps = 0;
+            session.tx_speed_bps = 0;
             *session.waiting_for_input_flag.lock().unwrap() = false;
             session.vpn_state = VpnState::Disconnecting;
             count += 1;
