@@ -208,38 +208,6 @@ pub async fn handle_connect_mode(app: &mut App, key: KeyEvent) -> Result<()> {
             app.cycle_focus_backward();
             return Ok(());
         }
-        (_, KeyCode::Up) => {
-            if app.focus == Focus::Logs {
-                app.scroll_logs_up();
-            }
-            return Ok(());
-        }
-        (_, KeyCode::Down) => {
-            if app.focus == Focus::Logs {
-                app.scroll_logs_down();
-            }
-            return Ok(());
-        }
-        (_, KeyCode::PageUp) => {
-            for _ in 0..10 {
-                app.scroll_logs_up();
-            }
-            return Ok(());
-        }
-        (_, KeyCode::PageDown) => {
-            for _ in 0..10 {
-                app.scroll_logs_down();
-            }
-            return Ok(());
-        }
-        (_, KeyCode::F(5)) => {
-            if let Some(session) = app.active_session_mut()
-                && !session.logs.is_empty()
-            {
-                session.log_scroll = session.logs.len() - 1;
-            }
-            return Ok(());
-        }
         _ => {
             if app.focus == Focus::Host {
                 let Some(session) = app.active_session() else {
@@ -432,6 +400,7 @@ async fn accept_cert_and_reconnect(app: &mut App) -> Result<()> {
         cert.subject_cn
     ));
     session.trusted_cert = Some(cert.hash.clone());
+    session.reset_connection_metrics();
     session.vpn_state = VpnState::Connecting;
     let session_id = session.id;
     let host = session.host.clone();
@@ -557,6 +526,7 @@ async fn do_connect(app: &mut App) -> Result<()> {
     let input_flag = session.waiting_for_input_flag.clone();
 
     if let Some(session) = app.active_session_mut() {
+        session.reset_connection_metrics();
         session.vpn_state = VpnState::Connecting;
     }
     app.push_log(format!("[APP] Menghubungkan ke {}:{}...", host, port));
@@ -609,6 +579,8 @@ async fn do_disconnect(app: &mut App) -> Result<()> {
     if let Some(session) = app.active_session_mut() {
         session.token_input.clear();
         session.pending_cert = None;
+        session.rx_speed_bps = 0;
+        session.tx_speed_bps = 0;
         *session.waiting_for_input_flag.lock().unwrap() = false;
         session.vpn_state = VpnState::Disconnecting;
     }
@@ -691,6 +663,8 @@ fn disconnect_all_sessions(app: &mut App) {
             let pid_store = session.vpn_pid.clone();
             session.token_input.clear();
             session.pending_cert = None;
+            session.rx_speed_bps = 0;
+            session.tx_speed_bps = 0;
             *session.waiting_for_input_flag.lock().unwrap() = false;
             session.vpn_state = VpnState::Disconnecting;
             count += 1;

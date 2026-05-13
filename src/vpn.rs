@@ -2,9 +2,13 @@ use crate::app::{AppEvent, CertInfo, VpnState};
 use anyhow::{Result, bail};
 use libc::{ESRCH, SIGKILL, SIGTERM, c_int, kill};
 use std::{
+    collections::HashMap,
     env,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -303,12 +307,18 @@ pub async fn connect(
     let cert_buf: Arc<Mutex<CertBuffer>> = Arc::new(Mutex::new(CertBuffer::default()));
     let token_requested_flag = Arc::new(Mutex::new(false));
     let gateway_connected = Arc::new(Mutex::new(false));
+    let speed_monitor_started = Arc::new(AtomicBool::new(false));
+    let stop_speed_monitor = Arc::new(AtomicBool::new(false));
+    let initial_net_stats = read_net_stats().await.unwrap_or_default();
 
     let tx1 = event_tx.clone();
     let cert_buf1 = cert_buf.clone();
     let flag1 = waiting_for_input_flag.clone();
     let token_flag1 = token_requested_flag.clone();
     let gateway_flag1 = gateway_connected.clone();
+    let speed_started1 = speed_monitor_started.clone();
+    let stop_speed1 = stop_speed_monitor.clone();
+    let initial_stats1 = initial_net_stats.clone();
     let stdin1 = stdin_arc.clone();
 
     tokio::spawn(async move {
@@ -321,6 +331,9 @@ pub async fn connect(
             flag1,
             token_flag1,
             gateway_flag1,
+            speed_started1,
+            stop_speed1,
+            initial_stats1,
             stdin1,
         )
         .await;
@@ -331,6 +344,9 @@ pub async fn connect(
     let flag2 = waiting_for_input_flag.clone();
     let token_flag2 = token_requested_flag.clone();
     let gateway_flag2 = gateway_connected.clone();
+    let speed_started2 = speed_monitor_started.clone();
+    let stop_speed2 = stop_speed_monitor.clone();
+    let initial_stats2 = initial_net_stats;
     let stdin2 = stdin_arc.clone();
 
     tokio::spawn(async move {
@@ -343,6 +359,9 @@ pub async fn connect(
             flag2,
             token_flag2,
             gateway_flag2,
+            speed_started2,
+            stop_speed2,
+            initial_stats2,
             stdin2,
         )
         .await;
@@ -352,6 +371,7 @@ pub async fn connect(
     let pid_store_waiter = pid_store.clone();
     let cert_buf_waiter = cert_buf.clone();
     let flag_waiter = waiting_for_input_flag.clone();
+    let stop_speed_waiter = stop_speed_monitor.clone();
 
     tokio::spawn(async move {
         wait_for_process(
@@ -361,6 +381,7 @@ pub async fn connect(
             pid_store_waiter,
             cert_buf_waiter,
             flag_waiter,
+            stop_speed_waiter,
         )
         .await;
     });
@@ -378,6 +399,9 @@ async fn read_stream(
     waiting_flag: Arc<Mutex<bool>>,
     token_requested: Arc<Mutex<bool>>,
     gateway_connected: Arc<Mutex<bool>>,
+    speed_monitor_started: Arc<AtomicBool>,
+    stop_speed_monitor: Arc<AtomicBool>,
+    initial_net_stats: HashMap<String, NetStats>,
     _stdin: Arc<Mutex<Option<tokio::process::ChildStdin>>>,
 ) {
     let mut lines = BufReader::new(stream).lines();
@@ -417,6 +441,16 @@ async fn read_stream(
                 state: VpnState::Connected,
             });
             *waiting_flag.lock().unwrap() = false;
+
+            if !speed_monitor_started.swap(true, Ordering::SeqCst) {
+                let tx_speed = tx.clone();
+                let stop_speed = stop_speed_monitor.clone();
+                let initial_stats = initial_net_stats.clone();
+                tokio::spawn(async move {
+                    monitor_connection_speed(session_id, tx_speed, initial_stats, stop_speed).await;
+                });
+            }
+
             continue;
         }
 
@@ -444,8 +478,10 @@ async fn wait_for_process(
     pid_store: Arc<Mutex<Option<u32>>>,
     cert_buf: Arc<Mutex<CertBuffer>>,
     waiting_flag: Arc<Mutex<bool>>,
+    stop_speed_monitor: Arc<AtomicBool>,
 ) {
     let status = child.wait().await;
+    stop_speed_monitor.store(true, Ordering::SeqCst);
     *pid_store.lock().unwrap() = None;
 
     let cert_info = cert_buf.lock().unwrap().try_emit();
@@ -499,6 +535,174 @@ async fn wait_for_process(
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct NetStats {
+    rx_bytes: u64,
+    tx_bytes: u64,
+}
+
+async fn monitor_connection_speed(
+    session_id: u64,
+    tx: mpsc::UnboundedSender<AppEvent>,
+    initial_stats: HashMap<String, NetStats>,
+    stop: Arc<AtomicBool>,
+) {
+    const SAMPLE_SECS: u64 = 5;
+
+    let mut selected_iface: Option<String> = None;
+    let mut previous_stats = read_net_stats().await.unwrap_or_default();
+
+    loop {
+        tokio::time::sleep(Duration::from_secs(SAMPLE_SECS)).await;
+
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+
+        let current_stats = match read_net_stats().await {
+            Ok(stats) => stats,
+            Err(e) => {
+                let _ = tx.send(AppEvent::DebugLog(format!(
+                    "[SPEED] Gagal membaca statistik interface: {}",
+                    e
+                )));
+                break;
+            }
+        };
+
+        let iface = match selected_iface.as_deref() {
+            Some(iface) if current_stats.contains_key(iface) => iface.to_string(),
+            _ => match detect_vpn_interface(&initial_stats, &previous_stats, &current_stats) {
+                Some(iface) => {
+                    let _ = tx.send(AppEvent::LogLine {
+                        session_id,
+                        line: format!("[SPEED] Monitor aktif di interface {}", iface),
+                    });
+                    selected_iface = Some(iface.clone());
+                    iface
+                }
+                None => {
+                    previous_stats = current_stats;
+                    continue;
+                }
+            },
+        };
+
+        if let (Some(previous), Some(current)) =
+            (previous_stats.get(&iface), current_stats.get(&iface))
+        {
+            let rx_per_sec = current.rx_bytes.saturating_sub(previous.rx_bytes) / SAMPLE_SECS;
+            let tx_per_sec = current.tx_bytes.saturating_sub(previous.tx_bytes) / SAMPLE_SECS;
+
+            let _ = tx.send(AppEvent::LogLine {
+                session_id,
+                line: format!(
+                    "[SPEED] ↓ {}/s ↑ {}/s ({})",
+                    format_speed(rx_per_sec),
+                    format_speed(tx_per_sec),
+                    iface
+                ),
+            });
+
+            let initial = initial_stats.get(&iface).copied().unwrap_or_default();
+            let rx_total = current.rx_bytes.saturating_sub(initial.rx_bytes);
+            let tx_total = current.tx_bytes.saturating_sub(initial.tx_bytes);
+
+            let _ = tx.send(AppEvent::SpeedUpdate {
+                session_id,
+                interface: iface.clone(),
+                rx_bps: rx_per_sec,
+                tx_bps: tx_per_sec,
+                rx_total,
+                tx_total,
+            });
+        }
+
+        previous_stats = current_stats;
+    }
+}
+
+async fn read_net_stats() -> Result<HashMap<String, NetStats>> {
+    let content = tokio::fs::read_to_string("/proc/net/dev").await?;
+    let mut stats = HashMap::new();
+
+    for line in content.lines().skip(2) {
+        let Some((iface, values)) = line.split_once(':') else {
+            continue;
+        };
+
+        let fields: Vec<&str> = values.split_whitespace().collect();
+        if fields.len() < 16 {
+            continue;
+        }
+
+        let rx_bytes = fields[0].parse::<u64>().unwrap_or(0);
+        let tx_bytes = fields[8].parse::<u64>().unwrap_or(0);
+
+        stats.insert(iface.trim().to_string(), NetStats { rx_bytes, tx_bytes });
+    }
+
+    Ok(stats)
+}
+
+fn detect_vpn_interface(
+    initial: &HashMap<String, NetStats>,
+    previous: &HashMap<String, NetStats>,
+    current: &HashMap<String, NetStats>,
+) -> Option<String> {
+    current
+        .iter()
+        .filter(|(iface, _)| is_likely_vpn_interface(iface))
+        .max_by_key(|(iface, stats)| {
+            let initial_stats = initial.get(*iface).copied().unwrap_or_default();
+            stats
+                .rx_bytes
+                .saturating_sub(initial_stats.rx_bytes)
+                .saturating_add(stats.tx_bytes.saturating_sub(initial_stats.tx_bytes))
+        })
+        .and_then(|(iface, stats)| {
+            let previous_stats = previous.get(iface).copied().unwrap_or_default();
+            let delta = stats
+                .rx_bytes
+                .saturating_sub(previous_stats.rx_bytes)
+                .saturating_add(stats.tx_bytes.saturating_sub(previous_stats.tx_bytes));
+            let is_new_iface = !initial.contains_key(iface);
+
+            if delta > 0 || is_new_iface {
+                Some(iface.clone())
+            } else {
+                None
+            }
+        })
+}
+
+fn is_likely_vpn_interface(iface: &str) -> bool {
+    ["ppp", "tun", "tap", "utun", "vpn"]
+        .iter()
+        .any(|prefix| iface.starts_with(prefix))
+}
+
+fn format_speed(bytes_per_sec: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+
+    let mut value = bytes_per_sec as f64;
+    let mut unit = UNITS[0];
+
+    for next_unit in UNITS.iter().skip(1) {
+        if value < 1024.0 {
+            break;
+        }
+        value /= 1024.0;
+        unit = next_unit;
+    }
+
+    if unit == "B" {
+        format!("{} {}", bytes_per_sec, unit)
+    } else {
+        format!("{:.1} {}", value, unit)
+    }
+}
+
 // ─── Send OTP Token ──────────────────────────────────────────────────────────
 pub async fn send_token(
     session_id: u64,
@@ -526,24 +730,8 @@ pub async fn send_token(
             stdin.write_all(token_line.as_bytes()).await?;
         }
 
-        let temp_file = format!("/tmp/fortivpn_token_{}.txt", pid);
-
-        let _ = tokio::fs::write(&temp_file, token_line.as_bytes()).await;
-
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "sudo cat {} > /proc/{}/fd/0 2>/dev/null",
-                &temp_file, pid
-            ))
-            .output()
-            .await;
-
-        let _ = tokio::fs::remove_file(&temp_file).await;
-
-        if let Ok(o) = output
-            && o.status.success()
-        {
+        let output = child.wait_with_output().await?;
+        if output.status.success() {
             let _ = event_tx.send(AppEvent::LogLine {
                 session_id,
                 line: "[TOKEN] ✅ Token berhasil dikirim".into(),

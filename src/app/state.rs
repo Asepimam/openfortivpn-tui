@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 use tokio::sync::mpsc;
 
 // ─── VPN Connection State ─────────────────────────────────────────────────────
@@ -66,7 +69,6 @@ pub enum Focus {
     // Action buttons
     Connect,
     Disconnect,
-    Logs,
 
     // Modal dialogs
     CertAccept,
@@ -99,11 +101,28 @@ impl PendingAction {
 // ─── Events ───────────────────────────────────────────────────────────────────
 #[derive(Debug)]
 pub enum AppEvent {
-    LogLine { session_id: u64, line: String },
+    LogLine {
+        session_id: u64,
+        line: String,
+    },
     DebugLog(String),
-    StateChanged { session_id: u64, state: VpnState },
+    StateChanged {
+        session_id: u64,
+        state: VpnState,
+    },
+    SpeedUpdate {
+        session_id: u64,
+        interface: String,
+        rx_bps: u64,
+        tx_bps: u64,
+        rx_total: u64,
+        tx_total: u64,
+    },
     NeedToken(u64),
-    CertError { session_id: u64, cert: CertInfo },
+    CertError {
+        session_id: u64,
+        cert: CertInfo,
+    },
 }
 
 pub struct ConnectionSession {
@@ -120,6 +139,12 @@ pub struct ConnectionSession {
     pub log_scroll: usize,
     pub pending_cert: Option<CertInfo>,
     pub trusted_cert: Option<String>,
+    pub connected_at: Option<Instant>,
+    pub vpn_interface: Option<String>,
+    pub rx_speed_bps: u64,
+    pub tx_speed_bps: u64,
+    pub rx_total_bytes: u64,
+    pub tx_total_bytes: u64,
     pub vpn_pid: Arc<Mutex<Option<u32>>>,
     pub waiting_for_input_flag: Arc<Mutex<bool>>,
 }
@@ -140,6 +165,12 @@ impl ConnectionSession {
             log_scroll: 0,
             pending_cert: None,
             trusted_cert: profile.trusted_cert.clone(),
+            connected_at: None,
+            vpn_interface: None,
+            rx_speed_bps: 0,
+            tx_speed_bps: 0,
+            rx_total_bytes: 0,
+            tx_total_bytes: 0,
             vpn_pid: Arc::new(Mutex::new(None)),
             waiting_for_input_flag: Arc::new(Mutex::new(false)),
         }
@@ -151,6 +182,15 @@ impl ConnectionSession {
         if !self.logs.is_empty() {
             self.log_scroll = self.logs.len().saturating_sub(1);
         }
+    }
+
+    pub fn reset_connection_metrics(&mut self) {
+        self.connected_at = None;
+        self.vpn_interface = None;
+        self.rx_speed_bps = 0;
+        self.tx_speed_bps = 0;
+        self.rx_total_bytes = 0;
+        self.tx_total_bytes = 0;
     }
 }
 
@@ -165,6 +205,7 @@ pub struct App {
     pub log_scroll: usize,
     pub notification: Option<(String, NotifLevel)>,
     pub notification_ttl: u8,
+    pub connection_error: Option<String>,
     pub pending_action: Option<PendingAction>,
     pub sessions: Vec<ConnectionSession>,
     pub active_session_index: Option<usize>,
@@ -215,6 +256,7 @@ impl App {
             log_scroll: 0,
             notification: None,
             notification_ttl: 0,
+            connection_error: None,
             pending_action: None,
             sessions: Vec::new(),
             active_session_index: None,
@@ -262,6 +304,15 @@ impl App {
         self.notification_ttl = 60;
     }
 
+    pub fn show_connection_error(&mut self, msg: impl Into<String>) {
+        self.connection_error = Some(msg.into());
+    }
+
+    pub fn clear_connection_error(&mut self) {
+        self.connection_error = None;
+        self.focus = Focus::Connect;
+    }
+
     pub fn tick_notification(&mut self) {
         if self.notification_ttl > 0 {
             self.notification_ttl -= 1;
@@ -276,6 +327,7 @@ impl App {
             self.active_session_state(),
             VpnState::WaitingToken | VpnState::WaitingCert
         ) || self.ui_mode == UiMode::Help
+            || self.connection_error.is_some()
             || self.pending_action.is_some()
     }
 
@@ -408,8 +460,7 @@ impl App {
                 Focus::Password => Focus::SudoPassword,
                 Focus::SudoPassword => Focus::Connect,
                 Focus::Connect => Focus::Disconnect,
-                Focus::Disconnect => Focus::Logs,
-                Focus::Logs => Focus::Host,
+                Focus::Disconnect => Focus::Host,
                 _ => Focus::Host,
             };
         }
@@ -436,13 +487,12 @@ impl App {
 
         if self.ui_mode == UiMode::Connect {
             self.focus = match self.focus {
-                Focus::Host => Focus::Logs,
+                Focus::Host => Focus::Disconnect,
                 Focus::Username => Focus::Host,
                 Focus::Password => Focus::Username,
                 Focus::SudoPassword => Focus::Password,
                 Focus::Connect => Focus::SudoPassword,
                 Focus::Disconnect => Focus::Connect,
-                Focus::Logs => Focus::Disconnect,
                 _ => Focus::Host,
             };
         }
@@ -495,23 +545,6 @@ impl App {
         for session in self.sessions.iter_mut() {
             if session.profile_name == profile_name {
                 session.trusted_cert = Some(cert_hash.to_string());
-            }
-        }
-    }
-
-    pub fn scroll_logs_up(&mut self) {
-        if let Some(session) = self.active_session_mut() {
-            session.log_scroll = session.log_scroll.saturating_sub(1);
-        }
-    }
-
-    pub fn scroll_logs_down(&mut self) {
-        if let Some(session) = self.active_session_mut()
-            && !session.logs.is_empty()
-        {
-            let max = session.logs.len().saturating_sub(1);
-            if session.log_scroll < max {
-                session.log_scroll += 1;
             }
         }
     }

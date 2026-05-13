@@ -33,7 +33,7 @@ Atau jika binary sudah dibuild:
 
 ## Debug Log ke File
 
-Secara default, output mentah dari proses `openfortivpn` tidak ditampilkan di panel log aplikasi.
+Secara default, output mentah dari proses `openfortivpn` tidak ditampilkan di UI aplikasi. Status koneksi ditampilkan lewat dashboard.
 
 Jika ingin menyimpan debug log ke file, jalankan dengan mode debug:
 
@@ -96,6 +96,6 @@ asepimam ALL=(root) NOPASSWD: /usr/bin/openfortivpn
 
 ## Ringkasan Perilaku Log
 
-- Mode normal: panel log hanya menampilkan status penting dari aplikasi
+- Mode normal: UI menampilkan status penting lewat dashboard koneksi
 - Mode debug `-d`: output mentah `openfortivpn` ikut disimpan ke `/tmp/openfortivpn-tui.log`
-- Token OTP tidak ditulis ke log UI
+- Token OTP tidak ditulis ke UI atau debug log aplikasi

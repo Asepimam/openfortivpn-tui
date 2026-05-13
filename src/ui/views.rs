@@ -6,6 +6,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, Padding, Paragraph},
 };
+use std::time::Duration;
 
 // ─── Palette ─────────────────────────────────────────────────────────────────
 const C_BG: Color = Color::Rgb(18, 18, 28);
@@ -19,10 +20,6 @@ const C_RED: Color = Color::Rgb(255, 80, 80);
 const C_YELLOW: Color = Color::Rgb(255, 210, 60);
 const C_ORANGE: Color = Color::Rgb(255, 140, 40);
 const C_CYAN: Color = Color::Rgb(60, 210, 210);
-const C_LOG_INFO: Color = Color::Rgb(140, 200, 255);
-const C_LOG_ERR: Color = Color::Rgb(255, 100, 100);
-const C_LOG_WARN: Color = Color::Rgb(255, 200, 80);
-
 // ─── Main render entry ────────────────────────────────────────────────────────
 pub fn render(f: &mut Frame, app: &App) {
     let full = f.area();
@@ -47,6 +44,10 @@ pub fn render(f: &mut Frame, app: &App) {
     }
     if app.pending_action.is_some() {
         render_action_confirm_popup(f, app, full);
+        return;
+    }
+    if let Some(message) = &app.connection_error {
+        render_connection_error_popup(f, message, full);
         return;
     }
 
@@ -271,7 +272,7 @@ fn render_body(f: &mut Frame, app: &App, area: Rect) {
                 .constraints([Constraint::Length(42), Constraint::Min(10)])
                 .split(rows[1]);
             render_controls(f, app, panels[0]);
-            render_logs(f, app, panels[1]);
+            render_connection_workspace(f, app, panels[1]);
         }
         UiMode::Help => {
             // Konten tetap dirender sesuai mode sebelumnya
@@ -296,7 +297,7 @@ fn render_body(f: &mut Frame, app: &App, area: Rect) {
                             .constraints([Constraint::Length(42), Constraint::Min(10)])
                             .split(rows[1]);
                         render_controls(f, app, panels[0]);
-                        render_logs(f, app, panels[1]);
+                        render_connection_workspace(f, app, panels[1]);
                     }
                     _ => {}
                 }
@@ -487,7 +488,6 @@ fn render_help_popup(f: &mut Frame, _app: &App, area: Rect) {
         ("Ctrl+Shift+W", "Tutup semua tab yang sudah idle"),
         ("Ctrl+P", "Tampilkan/sembunyikan password"),
         ("Ctrl+S", "Simpan konfigurasi ke profile"),
-        ("↑ / ↓ / PgUp / PgDn", "Scroll log"),
     ];
 
     let connect_text: Vec<Line> = connect_shortcuts
@@ -912,6 +912,169 @@ fn render_profile_form(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(cancel_btn, btn_rows[1]);
 }
 
+fn render_connection_workspace(f: &mut Frame, app: &App, area: Rect) {
+    render_connection_dashboard(f, app, area);
+}
+
+fn render_connection_dashboard(f: &mut Frame, app: &App, area: Rect) {
+    let Some(session) = app.active_session() else {
+        return;
+    };
+
+    let state = &session.vpn_state;
+    let (state_color, state_icon) = match state {
+        VpnState::Disconnected => (C_DIM, "○"),
+        VpnState::Connecting => (C_YELLOW, "◌"),
+        VpnState::WaitingToken | VpnState::WaitingCert => (C_ORANGE, "◎"),
+        VpnState::Connected => (C_GREEN, "●"),
+        VpnState::Disconnecting => (C_YELLOW, "◌"),
+        VpnState::Error(_) => (C_RED, "✖"),
+    };
+    let duration = session
+        .connected_at
+        .map(|started| format_duration(started.elapsed()))
+        .unwrap_or_else(|| "-".into());
+    let interface = session.vpn_interface.as_deref().unwrap_or("-");
+    let pid = session
+        .vpn_pid
+        .lock()
+        .unwrap()
+        .map(|pid| pid.to_string())
+        .unwrap_or_else(|| "-".into());
+
+    let block = Block::default()
+        .title(Span::styled(
+            " Connection Dashboard ",
+            Style::default().fg(C_FOCUS).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(C_BORDER))
+        .style(Style::default().bg(C_SURFACE));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+
+    let label = Style::default().fg(C_DIM);
+    let value = Style::default().fg(C_TEXT);
+    let endpoint = format!("{}:{}", session.host, session.port);
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Status  ", label),
+            Span::styled(
+                format!("{} {}", state_icon, state.label()),
+                Style::default()
+                    .fg(state_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("   Duration  ", label),
+            Span::styled(duration, value),
+        ])),
+        rows[0],
+    );
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Endpoint  ", label),
+            Span::styled(endpoint, value),
+            Span::styled("   User  ", label),
+            Span::styled(&session.username, value),
+        ])),
+        rows[1],
+    );
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Interface  ", label),
+            Span::styled(
+                interface,
+                Style::default().fg(C_CYAN).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("   PID  ", label),
+            Span::styled(pid, value),
+        ])),
+        rows[2],
+    );
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Speed  ", label),
+            Span::styled(
+                format!("↓ {}/s", format_bytes(session.rx_speed_bps)),
+                Style::default().fg(C_GREEN).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("   ", label),
+            Span::styled(
+                format!("↑ {}/s", format_bytes(session.tx_speed_bps)),
+                Style::default().fg(C_YELLOW).add_modifier(Modifier::BOLD),
+            ),
+        ])),
+        rows[3],
+    );
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Total  ", label),
+            Span::styled(
+                format!("↓ {}", format_bytes(session.rx_total_bytes)),
+                Style::default().fg(C_GREEN),
+            ),
+            Span::styled("   ", label),
+            Span::styled(
+                format!("↑ {}", format_bytes(session.tx_total_bytes)),
+                Style::default().fg(C_YELLOW),
+            ),
+        ])),
+        rows[4],
+    );
+}
+
+fn format_duration(duration: Duration) -> String {
+    let total_secs = duration.as_secs();
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+
+    if hours > 0 {
+        format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
+    } else {
+        format!("{:02}:{:02}", minutes, seconds)
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+
+    let mut value = bytes as f64;
+    let mut unit = UNITS[0];
+
+    for next_unit in UNITS.iter().skip(1) {
+        if value < 1024.0 {
+            break;
+        }
+        value /= 1024.0;
+        unit = next_unit;
+    }
+
+    if unit == "B" {
+        format!("{} {}", bytes, unit)
+    } else {
+        format!("{:.1} {}", value, unit)
+    }
+}
+
 // ─── Controls Panel ──────────────────────────────────────────────────────────
 fn render_controls(f: &mut Frame, app: &App, area: Rect) {
     let Some(session) = app.active_session() else {
@@ -1130,98 +1293,6 @@ fn render_input(
     f.render_widget(Paragraph::new(content).block(block), area);
 }
 
-// ─── Log Panel ───────────────────────────────────────────────────────────────
-fn render_logs(f: &mut Frame, app: &App, area: Rect) {
-    let Some(session) = app.active_session() else {
-        return;
-    };
-    let focused = app.focus == Focus::Logs;
-    let border_style = if focused {
-        Style::default().fg(C_FOCUS)
-    } else {
-        Style::default().fg(C_BORDER)
-    };
-
-    let title_style = if focused {
-        Style::default().fg(C_FOCUS).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(C_DIM)
-    };
-
-    let log_count = session.logs.len();
-    let title = format!(" 📋 Log ({} baris)  ", log_count);
-
-    let block = Block::default()
-        .title(Span::styled(&title, title_style))
-        .borders(Borders::ALL)
-        .border_type(if focused {
-            BorderType::Thick
-        } else {
-            BorderType::Rounded
-        })
-        .border_style(border_style)
-        .style(Style::default().bg(C_SURFACE));
-
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    if session.logs.is_empty() {
-        let empty = Paragraph::new(Span::styled(
-            "Belum ada log. Pilih profile dan tekan Connect untuk memulai...",
-            Style::default().fg(C_DIM),
-        ))
-        .alignment(Alignment::Center);
-        f.render_widget(empty, inner);
-        return;
-    }
-
-    let visible_height = inner.height as usize;
-    let total = session.logs.len();
-    let scroll = session.log_scroll;
-
-    let start = if total > visible_height {
-        scroll.min(total - visible_height)
-    } else {
-        0
-    };
-    let end = (start + visible_height).min(total);
-
-    let items: Vec<ListItem> = session.logs[start..end]
-        .iter()
-        .map(|line| {
-            let style = if line.contains("[ERR]") || line.contains("ERROR") {
-                Style::default().fg(C_LOG_ERR)
-            } else if line.contains("[WARN]") {
-                Style::default().fg(C_LOG_WARN)
-            } else if line.contains("[TOKEN]") {
-                Style::default().fg(C_ORANGE)
-            } else if line.contains("Connected") || line.contains("tunnel is up") {
-                Style::default().fg(C_GREEN).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(C_LOG_INFO)
-            };
-            ListItem::new(Line::from(Span::styled(line.clone(), style)))
-        })
-        .collect();
-
-    if total > visible_height {
-        let pct = ((scroll as f64 / (total - visible_height) as f64) * 100.0) as u8;
-        let scroll_info = format!(" {}% ↕  ", pct);
-        let scroll_area = Rect {
-            x: area.x + area.width - scroll_info.len() as u16 - 2,
-            y: area.y,
-            width: scroll_info.len() as u16,
-            height: 1,
-        };
-        f.render_widget(
-            Paragraph::new(Span::styled(scroll_info, Style::default().fg(C_DIM))),
-            scroll_area,
-        );
-    }
-
-    f.render_widget(List::new(items), inner);
-}
-
 // ─── Status / Hint Bar ───────────────────────────────────────────────────────
 fn render_statusbar(f: &mut Frame, app: &App, area: Rect) {
     if app.ui_mode == UiMode::Help {
@@ -1348,6 +1419,50 @@ fn render_notification(f: &mut Frame, msg: &str, level: &NotifLevel, area: Rect)
         .block(block)
         .alignment(Alignment::Center),
         notif_area,
+    );
+}
+
+fn render_connection_error_popup(f: &mut Frame, message: &str, area: Rect) {
+    let popup_w = (area.width.saturating_sub(4)).min(64).max(36);
+    let popup_h = 9u16.min(area.height.saturating_sub(2)).max(7);
+    let popup_x = area.x + area.width.saturating_sub(popup_w) / 2;
+    let popup_y = area.y + area.height.saturating_sub(popup_h) / 2;
+    let popup_area = Rect {
+        x: popup_x,
+        y: popup_y,
+        width: popup_w,
+        height: popup_h,
+    };
+    f.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .title(Span::styled(
+            " ✖ Gagal Koneksi ",
+            Style::default().fg(C_RED).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(C_RED))
+        .padding(Padding::uniform(1))
+        .style(Style::default().bg(C_SURFACE));
+
+    let content = vec![
+        Line::from(Span::styled(
+            message,
+            Style::default().fg(C_TEXT).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Tekan Enter atau Esc untuk kembali.",
+            Style::default().fg(C_DIM),
+        )),
+    ];
+
+    f.render_widget(
+        Paragraph::new(content)
+            .block(block)
+            .alignment(Alignment::Center),
+        popup_area,
     );
 }
 
