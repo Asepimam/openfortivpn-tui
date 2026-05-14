@@ -1,101 +1,213 @@
 # openfortivpn-tui
 
-TUI sederhana untuk menjalankan `openfortivpn` dengan dukungan profile, OTP, dan debug log.
+Simple terminal UI for `openfortivpn` with profile management, OTP support, multi-session support, and debug logging.
 
-## Prasyarat
+Repository: [openfortivpn-tui GitHub Repository](https://github.com/Asepimam/openfortivpn-tui?utm_source=chatgpt.com)
 
-Pastikan `openfortivpn` sudah terpasang di sistem.
+---
 
-Contoh install:
+## Features
+
+* Simple terminal-based interface
+* Multiple concurrent VPN sessions
+* Isolated session state management
+* OTP / 2FA support
+* Debug logging support
+* Profile management
+* Automatic process cleanup
+* Lightweight and fast Rust application
+
+---
+
+# Requirements
+
+Make sure `openfortivpn` is installed on your system.
+
+## Ubuntu / Debian
 
 ```bash
-sudo apt update && sudo apt install openfortivpn
+sudo apt update
+sudo apt install openfortivpn
 ```
 
-Binary biasanya berada di salah satu path berikut:
+Typical binary locations:
 
-- `/usr/bin/openfortivpn`
-- `/usr/sbin/openfortivpn`
+```text
+/usr/bin/openfortivpn
+/usr/sbin/openfortivpn
+```
 
-## Menjalankan Aplikasi
+---
 
-Mode normal:
+# Installation
+
+## macOS via Homebrew
+
+Install directly from Homebrew tap:
+
+```bash
+brew tap asepimam/tap
+brew install openfortivpn-tui
+```
+
+Or install directly:
+
+```bash
+brew install asepimam/tap/openfortivpn-tui
+```
+
+---
+
+## Linux via GitHub Release
+
+Download the latest release from:
+
+[GitHub Releases](https://github.com/Asepimam/openfortivpn-tui/releases?utm_source=chatgpt.com)
+
+Example:
+
+```bash
+wget https://github.com/Asepimam/openfortivpn-tui/releases/latest/download/openfortivpn-tui-linux.zip
+unzip openfortivpn-tui-linux.zip
+chmod +x openfortivpn-tui
+./openfortivpn-tui
+```
+
+---
+
+# Running the Application
+
+## Normal Mode
+
+Using Cargo:
 
 ```bash
 cargo run
 ```
 
-Atau jika binary sudah dibuild:
+Using compiled binary:
 
 ```bash
 ./target/debug/openfortivpn-tui
 ```
 
-## Debug Log ke File
+---
 
-Secara default, output mentah dari proses `openfortivpn` tidak ditampilkan di UI aplikasi. Status koneksi ditampilkan lewat dashboard.
+# Debug Logging
 
-Jika ingin menyimpan debug log ke file, jalankan dengan mode debug:
+By default, raw `openfortivpn` process output is not shown in the UI. The application dashboard only displays connection status and important events.
+
+To enable debug logging:
 
 ```bash
 cargo run -- -d
 ```
 
-Atau:
+Or:
 
 ```bash
 ./target/debug/openfortivpn-tui -d
 ```
 
-File log debug akan ditulis ke:
+Debug logs are written to:
 
-```bash
+```text
 /tmp/openfortivpn-tui.log
 ```
 
-Mode `-d` berguna untuk troubleshooting saat koneksi gagal, OTP bermasalah, atau ingin melihat output asli dari `openfortivpn`.
+Debug mode is useful for:
 
-## Setup sudoers untuk openfortivpn
+* VPN connection troubleshooting
+* OTP / authentication debugging
+* Inspecting raw `openfortivpn` output
 
-`openfortivpn` memerlukan privilege root. Cara paling aman adalah menambahkan rule `sudoers` khusus untuk binary `openfortivpn`, bukan memberi akses `NOPASSWD` untuk semua command.
+Sensitive OTP tokens are never written to the UI or debug log.
 
-Edit sudoers dengan:
+---
+
+# Sudoers Configuration
+
+`openfortivpn` requires root privileges.
+
+The recommended and safest approach is to allow passwordless execution only for the `openfortivpn` binary instead of granting unrestricted sudo access.
+
+Edit sudoers safely:
 
 ```bash
 sudo visudo
 ```
 
-Lalu tambahkan salah satu rule berikut sesuai lokasi binary:
+Add one of the following rules depending on your binary location.
 
-Jika binary ada di `/usr/bin/openfortivpn`:
+If installed at `/usr/bin/openfortivpn`:
 
 ```sudoers
 <username> ALL=(root) NOPASSWD: /usr/bin/openfortivpn
 ```
 
-Jika binary ada di `/usr/sbin/openfortivpn`:
+If installed at `/usr/sbin/openfortivpn`:
 
 ```sudoers
 <username> ALL=(root) NOPASSWD: /usr/sbin/openfortivpn
 ```
 
-Ganti `<username>` dengan user Linux yang menjalankan aplikasi ini.
-
-Contoh:
+Example:
 
 ```sudoers
 asepimam ALL=(root) NOPASSWD: /usr/bin/openfortivpn
 ```
 
-## Catatan Penting
+---
 
-- Lebih aman memakai rule per-user dibanding `%sudo ALL=(ALL) NOPASSWD: ...`
-- Jangan edit `/etc/sudoers` langsung tanpa `visudo`
-- Jika tidak ingin `NOPASSWD`, aplikasi tetap bisa memakai `sudo -S` dan meminta password sudo
-- Aplikasi akan mencoba mendeteksi apakah `openfortivpn` sudah terpasang dan apakah akses privilege tersedia
+# Important Notes
 
-## Ringkasan Perilaku Log
+* Per-user sudo rules are safer than global `%sudo ALL=(ALL) NOPASSWD`
+* Never edit `/etc/sudoers` directly without `visudo`
+* If `NOPASSWD` is not configured, the application can still use `sudo -S` and request the sudo password
+* The application automatically checks whether:
 
-- Mode normal: UI menampilkan status penting lewat dashboard koneksi
-- Mode debug `-d`: output mentah `openfortivpn` ikut disimpan ke `/tmp/openfortivpn-tui.log`
-- Token OTP tidak ditulis ke UI atau debug log aplikasi
+  * `openfortivpn` is installed
+  * required privileges are available
+
+---
+
+# Logging Behavior Summary
+
+## Normal Mode
+
+* Dashboard displays important VPN status information
+* Raw process output is hidden
+
+## Debug Mode (`-d`)
+
+* Raw `openfortivpn` output is written to:
+
+```text
+/tmp/openfortivpn-tui.log
+```
+
+* OTP tokens are never stored in logs
+
+---
+
+# Build From Source
+
+Requires Rust stable toolchain.
+
+```bash
+git clone https://github.com/Asepimam/openfortivpn-tui.git
+cd openfortivpn-tui
+cargo build --release
+```
+
+Run:
+
+```bash
+./target/release/openfortivpn-tui
+```
+
+---
+
+# License
+
+MIT License
